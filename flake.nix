@@ -3,13 +3,32 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-24.11";
+    flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs }: {
+  outputs =
+    { self, nixpkgs, ... }@inputs:
+    inputs.flake-utils.lib.eachDefaultSystem (
+      system:
+      let
+        pkgs = import nixpkgs { inherit system; };
+        python-env = pkgs.python3.withPackages (ps: with ps; [
+          ipdb
+          ipython
+          polars
+          python-lsp-server
+          datasets
+          tinygrad
+          tokenizers
+          tqdm
+        ]);
+      in
+      {
+        devShell = pkgs.mkShell rec {
+          buildInputs = [python-env];
+          nativeBuildInputs = buildInputs;
+        };
 
-    packages.x86_64-linux.hello = nixpkgs.legacyPackages.x86_64-linux.hello;
-
-    packages.x86_64-linux.default = self.packages.x86_64-linux.hello;
-
-  };
+      }
+    );
 }
