@@ -1,6 +1,9 @@
 from tinygrad.tensor import Tensor
 from tinygrad.nn.optim import AdamW
 from tinygrad.nn.state import get_parameters
+from tinygrad.engine.jit import TinyJit
+
+from tinygrad import Context, Device
 
 from tokenizers import Tokenizer
 
@@ -9,18 +12,25 @@ import polars
 
 FINEWEB_PATH = "/home/drozdziak1/Documents/datasets/fineweb/000_00000.parquet"
 
-N_BATCHES = 1000000
+N_BATCHES = 4096
 
-T_BATCH_SIZE = 50
-V_BATCH_SIZE = 20
+BATCH_SIZE = 8
 RNG_SEED = 0xdeadbeef
-CTX_SIZE = 100
 
-LR = 0e-5
+CTX_SIZE = 4096
+NUM_BLOCKS = 8 EMBED_DIM = 64
+NUM_HEADS = 4
+FF_DIM = 128
+DROPOUT = 0.1
+
+LR = 3e-5
+
+# Also stop training when train loss / val loss reaches this value
+TARGET_TV_LOSS_RATIO = 0.9
 
 
 class Transformer:
-    def __init__(self, ctx_size, num_blocks, embed_dim, num_heads, ff_dim, vocab_size):
+    def __init__(self, ctx_size, num_blocks, embed_dim, num_heads, ff_dim, vocab_size, dropout):
         assert embed_dim % num_heads == 0
 
         self.num_blocks = num_blocks
@@ -29,10 +39,11 @@ class Transformer:
         self.ff_dim = ff_dim
         self.ctx_size = ctx_size
         self.vocab_size = vocab_size
+        self.dropout = dropout
 
         self.embed = Tensor.scaled_uniform(vocab_size, embed_dim)
 
-        self.blocks = [TBlock(embed_dim, num_heads, ff_dim)for _ in range(num_blocks)]
+        self.blocks = [TBlock(embed_dim, num_heads, ff_dim, dropout)for _ in range(num_blocks)]
 
         self.unembed = Tensor.scaled_uniform(embed_dim, vocab_size)
 
@@ -47,7 +58,7 @@ class Transformer:
 
         x_refined = x_embedded.sequential(self.blocks)
 
-        x_unembed = x_refined.dot(self.unembed)
+        x_unembed = x_refined.dot(self.unembed).log_softmax()
 
         return x_unembed
 
@@ -57,14 +68,15 @@ class Transformer:
 
 
 class TBlock:
-    def __init__(self, embed_dim, num_heads, ff_dim):
+    def __init__(self, embed_dim, num_heads, ff_dim, dropout):
 
         assert embed_dim % num_heads == 0
 
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        self.head_size = embed_dim / num_heads
+        self.head_size = embed_dim // num_heads
         self.ff_dim = ff_dim
+        self.dropout = dropout
         
         self.ln_w = Tensor.ones(embed_dim)
         self.ln_b = Tensor.zeros(embed_dim)
@@ -89,28 +101,30 @@ class TBlock:
 
         x_ln = x.layernorm().linear(self.ln_w, self.ln_b)
 
-        x_q, x_k, x_v = [x_ln.dot(t).reshape(x_ln[0], x_ln[1], self.num_heads, self.head_size) for t in [self.q_w, self.k_w, self.v_w]]
+        x_q, x_k, x_v = [x_ln.dot(t).reshape(x_ln.shape[0], x_ln.shape[1], self.num_heads, self.head_size) for t in [self.q_w, self.k_w, self.v_w]]
 
-        x_atn = Tensor.scaled_dot_product_attention(q, k, v)
+        x_atn = Tensor.scaled_dot_product_attention(x_q, x_k, x_v)
 
         x_atn_out = x_atn.reshape(x.shape).dot(self.atn_out_w)
 
-        x += x_atn_out
+        x = x + x_atn_out.dropout(self.dropout)
 
         x_ff1 = x.linear(self.ff1_w, self.ff1_b).gelu()
 
         x_ff2 = x_ff1.linear(self.ff2_w, self.ff2_b)
 
-        x += x_ff2
+        x = x + x_ff2.dropout(self.dropout)
+
+        return x
 
 
 def load_tokenizer(model_name="gpt2"):
     return Tokenizer.from_pretrained(model_name)
 
-def load_dataset(data_path=FINEWEB_PATH, val_batch_size=V_BATCH_SIZE):
+def load_dataset(data_path=FINEWEB_PATH):
     df = polars.read_parquet(data_path, columns=['text'])
 
-    return df.sample(n=val_batch_size, seed=RNG_SEED), df
+    return df
 
 def dataset_batch_iter(df, tokenizer, batch_size, ctx_size=CTX_SIZE):
     """
@@ -136,47 +150,70 @@ def dataset_batch_iter(df, tokenizer, batch_size, ctx_size=CTX_SIZE):
 
 
 def train_step(model, batch, opt):
+    with Tensor.train():
+        x = [sample[:-1] for sample in batch]
+        y_gt = [sample[1:] for sample in batch]
+
+        y = model(Tensor(x))
+
+        loss = y.sparse_categorical_crossentropy(Tensor(y_gt))
+
+        opt.zero_grad()
+
+        loss.backward()
+
+        opt.step()
+
+        return loss.numpy()
+
+train_step = TinyJit(train_step)
+
+def eval_step(model, batch):
     x = [sample[:-1] for sample in batch]
     y_gt = [sample[1:] for sample in batch]
 
     y = model(Tensor(x))
 
-    loss = y.sparse_categorical_crossentropy(y_gt)
-
-    opt.zero_grad()
-    
-    loss.backward()
-
-    opt.step()
+    loss = y.sparse_categorical_crossentropy(Tensor(y_gt))
 
     return loss.numpy()
-
     
-
+eval_step = TinyJit(eval_step)
     
 
 
 if __name__ == "__main__":
     tok = load_tokenizer()
 
-    v_data, t_data = load_dataset()
+    df = load_dataset()
 
-    t_df_it = dataset_batch_iter(t_data, tok, T_BATCH_SIZE)
+    df_it = dataset_batch_iter(df, tok, BATCH_SIZE)
 
-    model = Transformer(CTX_SIZE, 16, 64, 4, 256, tok.get_vocab_size())
+    v_data_batch = next(df_it)
 
-    opt = AdamW(params=get_parameters(model), lr=LR)
+    model = Transformer(CTX_SIZE, NUM_BLOCKS, EMBED_DIM, NUM_HEADS, FF_DIM, tok.get_vocab_size(), DROPOUT)
 
-    with Tensor.train():
-        for i in range(N_BATCHES):
-            loss = train_step(model, next(t_df_it), opt)
+    params = get_parameters(model)
 
-            if i % 100 == 0:
-                print(f"Step {i-1} | Loss: {loss}")
+    param_count = sum(map(lambda t: len(t.reshape(-1)), params))
 
-        
-        
+    print(f"Training a {param_count} parameter model")
 
-    ipdb.set_trace()
-    
-    
+    opt = AdamW(params=params, lr=LR)
+
+    for i in range(N_BATCHES):
+        t_loss = train_step(model, next(df_it), opt)
+
+        print(f"Step {i+1:10} | T Loss: {t_loss}")
+
+        if i % 20 == 0:
+            v_loss = eval_step(model, v_data_batch)
+
+            print(f"Step {i+1:10} | V Loss: {v_loss}")
+
+            if t_loss / v_loss < TARGET_TV_LOSS_RATIO:
+                print(f"Reached target t/v loss ratio {TARGET_TV_LOSS_RATIO}")
+                break
+
+
+            
