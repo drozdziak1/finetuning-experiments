@@ -167,7 +167,7 @@ def train_step(model, batch, opt):
 
             y_hat = model(Tensor(x))
 
-            loss = y_hat.sparse_categorical_crossentropy(Tensor(x))
+            loss = y_hat.sparse_categorical_crossentropy(Tensor(y_gt))
 
             loss.backward()
 
@@ -198,19 +198,19 @@ def eval_step(model, batches):
 def gen_step(model: Transformer, tokenizer: Tokenizer):
     x = sum([tokenizer.encode("<|endoftext|>").ids for _ in range(CTX_SIZE)], [])
 
-    k = 4
+    k = 32
 
-    tokens = tokenizer.encode("I am").ids
+    tokens = tokenizer.encode("What").ids
     for i in range(20):
 
         for j in range(len(tokens)):
-            x[CTX_SIZE - 1 - len(tokens) + j] = tokens[j]
+            x[j] = tokens[j]
 
         ys = model(Tensor(x).reshape(1, -1))
 
-        last_y = ys[0][-1].numpy()
+        last_y = ys[0][len(tokens) - 1].numpy()
 
-        topk = last_y.argpartition(k)[-k:]
+        topk = last_y.argpartition(-k)[-k:]
 
         idx = random.randint(0, k - 1)
 
