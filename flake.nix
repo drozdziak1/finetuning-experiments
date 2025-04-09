@@ -19,6 +19,7 @@
             polars
             python-lsp-server
             datasets
+            tiktoken
             tinygrad
             tokenizers
             tqdm

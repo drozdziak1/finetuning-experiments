@@ -5,28 +5,42 @@ from tinygrad.engine.jit import TinyJit
 
 from tinygrad import Context, Device
 
+from tinygrad.nn import LayerNorm, Linear, Embedding
+
 from tokenizers import Tokenizer
 
 import ipdb
+import numpy as np
 import polars
+import random
+import sys
+
 
 FINEWEB_PATH = "/home/drozdziak1/Documents/datasets/fineweb/000_00000.parquet"
 
-N_BATCHES = 4096
+N_BATCHES = 16384 * 16384
 
-BATCH_SIZE = 8
-RNG_SEED = 0xdeadbeef
+N_V_BATCHES = 1
 
-CTX_SIZE = 4096
-NUM_BLOCKS = 8 EMBED_DIM = 64
-NUM_HEADS = 4
+BATCH_SIZE = 32
+
+MINIBATCH_SIZE = 4
+RNG_SEED = 0xfacebeef
+random.seed(RNG_SEED)
+
+Tensor.manual_seed(RNG_SEED)
+
+CTX_SIZE = 32
+NUM_BLOCKS = 8
+EMBED_DIM = 64
+NUM_HEADS = 8
 FF_DIM = 128
 DROPOUT = 0.1
 
 LR = 3e-5
 
 # Also stop training when train loss / val loss reaches this value
-TARGET_TV_LOSS_RATIO = 0.9
+TARGET_TV_LOSS_RATIO = 0.001
 
 
 class Transformer:
@@ -41,20 +55,18 @@ class Transformer:
         self.vocab_size = vocab_size
         self.dropout = dropout
 
-        self.embed = Tensor.scaled_uniform(vocab_size, embed_dim)
+        self.embed = Embedding(vocab_size, embed_dim)
 
-        self.blocks = [TBlock(embed_dim, num_heads, ff_dim, dropout)for _ in range(num_blocks)]
+        self.blocks = [TBlock(embed_dim, num_heads, ff_dim, dropout) for _ in range(num_blocks)]
 
-        self.unembed = Tensor.scaled_uniform(embed_dim, vocab_size)
+        self.unembed = Tensor.kaiming_normal(embed_dim, vocab_size)
 
     def __call__(self, x: Tensor):
         """
         X: (B, T)
         """
 
-        x_onehot = x.one_hot(self.vocab_size)
-
-        x_embedded = x_onehot.dot(self.embed)
+        x_embedded = self.embed(x)
 
         x_refined = x_embedded.sequential(self.blocks)
 
@@ -78,40 +90,36 @@ class TBlock:
         self.ff_dim = ff_dim
         self.dropout = dropout
         
-        self.ln_w = Tensor.ones(embed_dim)
-        self.ln_b = Tensor.zeros(embed_dim)
+        # self.ln = LayerNorm(embed_dim)
 
+        self.q_w = Tensor.kaiming_normal(embed_dim, embed_dim)
+        self.k_w = Tensor.kaiming_normal(embed_dim, embed_dim)
+        self.v_w = Tensor.kaiming_normal(embed_dim, embed_dim)
 
-        self.q_w = Tensor.scaled_uniform(embed_dim, embed_dim)
-        self.k_w = Tensor.scaled_uniform(embed_dim, embed_dim)
-        self.v_w = Tensor.scaled_uniform(embed_dim, embed_dim)
-
-        self.atn_out_w = Tensor.scaled_uniform(embed_dim, embed_dim)
+        self.atn_out_w = Tensor.kaiming_normal(embed_dim, embed_dim)
         
-        self.ff1_w = Tensor.scaled_uniform(embed_dim, ff_dim)
-        self.ff1_b = Tensor.scaled_uniform(ff_dim)
+        self.ff1 = Linear(embed_dim, ff_dim)
+        self.ff2 = Linear(ff_dim, embed_dim)
 
-        self.ff2_w = Tensor.scaled_uniform(ff_dim, embed_dim)
-        self.ff2_b = Tensor.scaled_uniform(embed_dim)
         
     def __call__(self, x: Tensor):
         """
         X: (B, T, C)
         """
 
-        x_ln = x.layernorm().linear(self.ln_w, self.ln_b)
+        x_ln = x
 
         x_q, x_k, x_v = [x_ln.dot(t).reshape(x_ln.shape[0], x_ln.shape[1], self.num_heads, self.head_size) for t in [self.q_w, self.k_w, self.v_w]]
 
-        x_atn = Tensor.scaled_dot_product_attention(x_q, x_k, x_v)
+        x_atn = Tensor.scaled_dot_product_attention(x_q, x_k, x_v, is_causal=True)
 
         x_atn_out = x_atn.reshape(x.shape).dot(self.atn_out_w)
 
         x = x + x_atn_out.dropout(self.dropout)
 
-        x_ff1 = x.linear(self.ff1_w, self.ff1_b).gelu()
+        x_ff1 = self.ff1(x).gelu()
 
-        x_ff2 = x_ff1.linear(self.ff2_w, self.ff2_b)
+        x_ff2 = self.ff2(x_ff1)
 
         x = x + x_ff2.dropout(self.dropout)
 
@@ -126,7 +134,7 @@ def load_dataset(data_path=FINEWEB_PATH):
 
     return df
 
-def dataset_batch_iter(df, tokenizer, batch_size, ctx_size=CTX_SIZE):
+def dataset_minibatch_iter(df, tokenizer, batch_size, ctx_size=CTX_SIZE):
     """
     each iteration yields a training batch
     """
@@ -138,7 +146,7 @@ def dataset_batch_iter(df, tokenizer, batch_size, ctx_size=CTX_SIZE):
         buf = tokenizer.encode(next(df_iter)[0]).ids
         while len(batch) < batch_size:
             while len(buf) < ctx_size + 1:
-                buf += tokenizer.encode("<|end_of_text|>").ids
+                buf += tokenizer.encode("<|endoftext|>").ids
                 buf += tokenizer.encode(next(df_iter)[0]).ids
 
             batch_item = buf[:ctx_size + 1]
@@ -148,48 +156,78 @@ def dataset_batch_iter(df, tokenizer, batch_size, ctx_size=CTX_SIZE):
 
         yield batch
 
-
+@TinyJit    
 def train_step(model, batch, opt):
+    loss_mean = Tensor(0.0)
     with Tensor.train():
-        x = [sample[:-1] for sample in batch]
-        y_gt = [sample[1:] for sample in batch]
+
+        for mb in batch:
+            x = [sample[:-1] for sample in mb]
+            y_gt = [sample[1:] for sample in mb]
+
+            y_hat = model(Tensor(x))
+
+            loss = y_hat.sparse_categorical_crossentropy(Tensor(x))
+
+            loss.backward()
+
+            loss_mean = loss_mean + loss / len(batch)
+
+        opt.step()
+        opt.zero_grad()
+
+    return loss_mean.numpy()
+
+@TinyJit    
+def eval_step(model, batches):
+    loss_sum = 0.0
+
+    for b in batches:
+        x = [sample[:-1] for sample in b]
+        y_gt = [sample[1:] for sample in b]
 
         y = model(Tensor(x))
 
-        loss = y.sparse_categorical_crossentropy(Tensor(y_gt))
+        loss_sum += y.sparse_categorical_crossentropy(Tensor(y_gt)).item()
 
-        opt.zero_grad()
+    loss_mean = loss_sum / len(batches)
 
-        loss.backward()
-
-        opt.step()
-
-        return loss.numpy()
-
-train_step = TinyJit(train_step)
-
-def eval_step(model, batch):
-    x = [sample[:-1] for sample in batch]
-    y_gt = [sample[1:] for sample in batch]
-
-    y = model(Tensor(x))
-
-    loss = y.sparse_categorical_crossentropy(Tensor(y_gt))
-
-    return loss.numpy()
+    return loss_mean
     
-eval_step = TinyJit(eval_step)
-    
+@TinyJit
+def gen_step(model: Transformer, tokenizer: Tokenizer):
+    x = sum([tokenizer.encode("<|endoftext|>").ids for _ in range(CTX_SIZE)], [])
 
+    k = 4
+
+    tokens = tokenizer.encode("I am").ids
+    for i in range(20):
+
+        for j in range(len(tokens)):
+            x[CTX_SIZE - 1 - len(tokens) + j] = tokens[j]
+
+        ys = model(Tensor(x).reshape(1, -1))
+
+        last_y = ys[0][-1].numpy()
+
+        topk = last_y.argpartition(k)[-k:]
+
+        idx = random.randint(0, k - 1)
+
+        tok_id = topk[idx]
+
+        tokens += [tok_id]
+
+    return tokenizer.decode(x)
 
 if __name__ == "__main__":
     tok = load_tokenizer()
 
     df = load_dataset()
 
-    df_it = dataset_batch_iter(df, tok, BATCH_SIZE)
+    df_it = dataset_minibatch_iter(df, tok, MINIBATCH_SIZE)
 
-    v_data_batch = next(df_it)
+    v_data_batches = list(map(lambda _: next(df_it), range(N_V_BATCHES)))
 
     model = Transformer(CTX_SIZE, NUM_BLOCKS, EMBED_DIM, NUM_HEADS, FF_DIM, tok.get_vocab_size(), DROPOUT)
 
@@ -202,18 +240,23 @@ if __name__ == "__main__":
     opt = AdamW(params=params, lr=LR)
 
     for i in range(N_BATCHES):
-        t_loss = train_step(model, next(df_it), opt)
+        batch = [next(df_it) for _ in range(BATCH_SIZE)]
+
+        t_loss = train_step(model, batch, opt)
 
         print(f"Step {i+1:10} | T Loss: {t_loss}")
 
         if i % 20 == 0:
-            v_loss = eval_step(model, v_data_batch)
+            v_loss = eval_step(model, v_data_batches)
 
             print(f"Step {i+1:10} | V Loss: {v_loss}")
 
             if t_loss / v_loss < TARGET_TV_LOSS_RATIO:
-                print(f"Reached target t/v loss ratio {TARGET_TV_LOSS_RATIO}")
+                print(f"Target T/V loss ratio {TARGET_TV_LOSS_RATIO} reached")
                 break
 
+        if i % 100 == 0:
+            gen_str = gen_step(model, tok)
 
+            print(f"Gen: {gen_str}")
             
