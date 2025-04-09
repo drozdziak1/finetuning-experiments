@@ -264,23 +264,35 @@ if __name__ == "__main__":
 
     opt = AdamW(params=params, lr=LR)
 
+    # I'm a bit tired of setting DEBUG=2 manually when playing with the  metaparameters
+    first_pass = True
+
     for i in range(N_BATCHES):
-        batch = [next(df_it) for _ in range(BATCH_SIZE)]
+        ctx = None
+        if first_pass:
+            ctx = Context(DEBUG=2)
+        else:
+            ctx = Context()
 
-        t_loss, t_acc = train_step(model, batch, opt)
+        with ctx:
+            batch = [next(df_it) for _ in range(BATCH_SIZE)]
 
-        print(f"Step {i+1:10} | T Loss: {t_loss:10.5} | T acc: {t_acc:7.5}")
+            t_loss, t_acc = train_step(model, batch, opt)
 
-        if i % 20 == 0:
-            v_loss, v_acc = eval_step(model, v_data_batches)
+            print(f"Step {i+1:10} | T Loss: {t_loss:10.5} | T acc: {t_acc:7.5}")
 
-            print(f"Step {i+1:10} | V Loss: {v_loss:10.5} | V acc: {v_acc:7.5}")
+            if i % 20 == 0:
+                v_loss, v_acc = eval_step(model, v_data_batches)
 
-            if t_loss / v_loss < TARGET_TV_LOSS_RATIO:
-                print(f"Target T/V loss ratio {TARGET_TV_LOSS_RATIO} reached")
-                break
+                print(f"Step {i+1:10} | V Loss: {v_loss:10.5} | V acc: {v_acc:7.5}")
 
-        if i % 100 == 0:
-            gen_str = gen_step(model, tok)
+                if t_loss / v_loss < TARGET_TV_LOSS_RATIO:
+                    print(f"Target T/V loss ratio {TARGET_TV_LOSS_RATIO} reached")
+                    break
 
-            print(f"Gen: {gen_str}")
+            if i % 100 == 0:
+                gen_str = gen_step(model, tok)
+
+                print(f"Gen: {gen_str}")
+
+        first_pass = False
