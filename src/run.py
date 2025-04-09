@@ -1,13 +1,12 @@
 from tinygrad.tensor import Tensor
-from tinygrad.nn.optim import AdamW
+from tinygrad.nn.optim import AdamW, Optimizer
 from tinygrad.nn.state import get_parameters
 from tinygrad.engine.jit import TinyJit
 
 from tinygrad import Context, Device
-
 from tinygrad.nn import LayerNorm, Linear, Embedding
-
 from tokenizers import Tokenizer
+from typing import List
 
 import ipdb
 import numpy as np
@@ -22,7 +21,7 @@ N_BATCHES = 16384 * 16384
 
 N_V_BATCHES = 1
 
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 
 MINIBATCH_SIZE = 4
 RNG_SEED = 0xfacebeef
@@ -30,7 +29,7 @@ random.seed(RNG_SEED)
 
 Tensor.manual_seed(RNG_SEED)
 
-CTX_SIZE = 32
+CTX_SIZE = 128
 NUM_BLOCKS = 8
 EMBED_DIM = 64
 NUM_HEADS = 8
@@ -39,8 +38,22 @@ DROPOUT = 0.1
 
 LR = 3e-5
 
+TOPK_K = 2
+
 # Also stop training when train loss / val loss reaches this value
 TARGET_TV_LOSS_RATIO = 0.001
+
+def gen_pos_enc(ctx_size, embed_dim):
+    pe = np.zeros((ctx_size, embed_dim))
+
+    pos = np.arange(0, ctx_size, dtype=np.float32).reshape(-1, 1)
+
+    div_term = np.exp(np.arange(0, embed_dim, 2) * (-np.log(10000.0) / embed_dim))
+
+    pe[:, 0::2] = np.sin(pos * div_term)
+    pe[:, 1::2] = np.cos(pos * div_term)
+
+    return Tensor(pe, requires_grad=False)
 
 
 class Transformer:
@@ -57,6 +70,8 @@ class Transformer:
 
         self.embed = Embedding(vocab_size, embed_dim)
 
+        self.pe = gen_pos_enc(ctx_size, embed_dim)
+
         self.blocks = [TBlock(embed_dim, num_heads, ff_dim, dropout) for _ in range(num_blocks)]
 
         self.unembed = Tensor.kaiming_normal(embed_dim, vocab_size)
@@ -68,15 +83,21 @@ class Transformer:
 
         x_embedded = self.embed(x)
 
-        x_refined = x_embedded.sequential(self.blocks)
+        batch_size, seq_len = x.shape
 
-        x_unembed = x_refined.dot(self.unembed).log_softmax()
+        position_embeddings = self.pe[:seq_len].unsqueeze(0) # (1, seq_len, embedding_dim)
+
+        x_pe = x_embedded + position_embeddings.expand(batch_size, -1, -1)
+
+        x_refined = x_pe.sequential(self.blocks)
+
+        x_unembed = x_refined.dot(self.unembed).softmax()
 
         return x_unembed
 
-        
 
-        
+
+
 
 
 class TBlock:
@@ -89,7 +110,7 @@ class TBlock:
         self.head_size = embed_dim // num_heads
         self.ff_dim = ff_dim
         self.dropout = dropout
-        
+
         # self.ln = LayerNorm(embed_dim)
 
         self.q_w = Tensor.kaiming_normal(embed_dim, embed_dim)
@@ -97,11 +118,11 @@ class TBlock:
         self.v_w = Tensor.kaiming_normal(embed_dim, embed_dim)
 
         self.atn_out_w = Tensor.kaiming_normal(embed_dim, embed_dim)
-        
+
         self.ff1 = Linear(embed_dim, ff_dim)
         self.ff2 = Linear(ff_dim, embed_dim)
 
-        
+
     def __call__(self, x: Tensor):
         """
         X: (B, T, C)
@@ -156,10 +177,13 @@ def dataset_minibatch_iter(df, tokenizer, batch_size, ctx_size=CTX_SIZE):
 
         yield batch
 
-@TinyJit    
-def train_step(model, batch, opt):
+@TinyJit
+def train_step(model: Transformer, batch: List[List[List[int]]], opt: Optimizer):
     loss_mean = Tensor(0.0)
+    acc = Tensor(0.0)
     with Tensor.train():
+
+        opt.zero_grad()
 
         for mb in batch:
             x = [sample[:-1] for sample in mb]
@@ -167,40 +191,43 @@ def train_step(model, batch, opt):
 
             y_hat = model(Tensor(x))
 
-            loss = y_hat.sparse_categorical_crossentropy(Tensor(y_gt))
-
-            loss.backward()
+            loss = y_hat.sparse_categorical_crossentropy(Tensor(y_gt)).backward()
 
             loss_mean = loss_mean + loss / len(batch)
 
+            acc_scores = y_hat.argmax(-1) == Tensor(y_gt)
+            acc = acc + acc_scores.mean() / len(batch)
+
         opt.step()
-        opt.zero_grad()
 
-    return loss_mean.numpy()
+    return loss_mean.numpy(), acc.numpy()
 
-@TinyJit    
+@TinyJit
 def eval_step(model, batches):
-    loss_sum = 0.0
+    loss_mean = Tensor(0.0)
+    acc = Tensor(0.0)
 
     for b in batches:
         x = [sample[:-1] for sample in b]
         y_gt = [sample[1:] for sample in b]
 
-        y = model(Tensor(x))
+        y_hat = model(Tensor(x))
 
-        loss_sum += y.sparse_categorical_crossentropy(Tensor(y_gt)).item()
+        loss_mean = loss_mean + y_hat.sparse_categorical_crossentropy(Tensor(y_gt)).item() / len(batches)
 
-    loss_mean = loss_sum / len(batches)
+        acc_scores = y_hat.argmax(-1) == Tensor(y_gt)
+        acc = acc + acc_scores.mean() / len(batch)
 
-    return loss_mean
-    
-@TinyJit
+    return loss_mean.numpy(), acc.numpy()
+
+# @TinyJit
 def gen_step(model: Transformer, tokenizer: Tokenizer):
     x = sum([tokenizer.encode("<|endoftext|>").ids for _ in range(CTX_SIZE)], [])
 
-    k = 32
+    k = TOPK_K
 
     tokens = tokenizer.encode("What").ids
+
     for i in range(20):
 
         for j in range(len(tokens)):
@@ -212,9 +239,7 @@ def gen_step(model: Transformer, tokenizer: Tokenizer):
 
         topk = last_y.argpartition(-k)[-k:]
 
-        idx = random.randint(0, k - 1)
-
-        tok_id = topk[idx]
+        tok_id = np.random.choice(topk)
 
         tokens += [tok_id]
 
@@ -242,14 +267,14 @@ if __name__ == "__main__":
     for i in range(N_BATCHES):
         batch = [next(df_it) for _ in range(BATCH_SIZE)]
 
-        t_loss = train_step(model, batch, opt)
+        t_loss, t_acc = train_step(model, batch, opt)
 
-        print(f"Step {i+1:10} | T Loss: {t_loss}")
+        print(f"Step {i+1:10} | T Loss: {t_loss:10.5} | T acc: {t_acc:7.5}")
 
         if i % 20 == 0:
-            v_loss = eval_step(model, v_data_batches)
+            v_loss, v_acc = eval_step(model, v_data_batches)
 
-            print(f"Step {i+1:10} | V Loss: {v_loss}")
+            print(f"Step {i+1:10} | V Loss: {v_loss:10.5} | V acc: {v_acc:7.5}")
 
             if t_loss / v_loss < TARGET_TV_LOSS_RATIO:
                 print(f"Target T/V loss ratio {TARGET_TV_LOSS_RATIO} reached")
@@ -259,4 +284,3 @@ if __name__ == "__main__":
             gen_str = gen_step(model, tok)
 
             print(f"Gen: {gen_str}")
-            
