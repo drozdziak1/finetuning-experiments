@@ -2,17 +2,23 @@ from tinygrad.tensor import Tensor
 from tinygrad.nn.optim import AdamW, Optimizer
 from tinygrad.nn.state import get_parameters
 from tinygrad.engine.jit import TinyJit
-
 from tinygrad import Context, Device, dtypes
 from tinygrad.nn import LayerNorm, Linear, Embedding
+
 from tokenizers import Tokenizer
 from typing import List
 
+from lr_scheduler import CosineAnnealingLR
+
 import ipdb
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 import numpy as np
 import polars
 import random
+import signal
 import sys
+import threading
 
 
 FINEWEB_PATH = "/home/drozdziak1/Documents/datasets/fineweb/000_00000.parquet"
@@ -20,8 +26,27 @@ FINEWEB_PATH = "/home/drozdziak1/Documents/datasets/fineweb/000_00000.parquet"
 N_BATCHES = 16384 * 16384
 
 N_V_BATCHES = 1
+V_INTERVAL = 50
 
-MINIBATCH_SIZE = 512
+MINIBATCH_SIZE = 256
+CTX_SIZE = 64
+
+WARMUP_ROUNDS = MINIBATCH_SIZE * CTX_SIZE // 512
+
+NUM_BLOCKS = 12
+EMBED_DIM = 768
+NUM_HEADS = 12
+FF_DIM = 4 * EMBED_DIM // 3
+DROPOUT = 0.1
+
+LR = 1e-4
+
+EPSILON = 1e-5
+
+TOPK_K = 8
+
+N_GEN_TOKENS = 8
+
 RNG_SEED = 0xdeadbeef
 random.seed(RNG_SEED)
 
@@ -29,20 +54,58 @@ Tensor.manual_seed(RNG_SEED)
 
 NP_RNG = np.random.default_rng(seed=RNG_SEED)
 
-CTX_SIZE = 64
-NUM_BLOCKS = 4
-EMBED_DIM = 96
-NUM_HEADS = 4
-FF_DIM = 4 * EMBED_DIM // 3
-DROPOUT = 0.1
 
-LR = 3e-5
+class ChartData:
+    def __init__(self):
+        self.fig, (self.ax_loss, self.ax_acc, self.ax_acc_unique_hits) = plt.subplots(3)
 
-EPSILON = 1e-5
+        self.t_loss = np.array([])
+        self.t_acc = np.array([])
+        self.t_acc_unique_hits = np.array([])
+        self.v_loss = np.array([])
+        self.v_acc = np.array([])
+        self.v_acc_unique_hits = np.array([])
 
-TOPK_K = 8
+        self.ax_loss.set_title("Loss")
+        self.ax_loss.set_xlabel("training batch")
+        self.ax_loss.set_ylabel("cat x-entropy loss")
 
-N_GEN_TOKENS = 8
+        self.ax_acc.set_title("Accuracy")
+        self.ax_acc.set_xlabel("training batch")
+        self.ax_acc.set_ylabel("accuracy")
+
+        self.ax_acc_unique_hits.set_title("Unique accuracy hits")
+        self.ax_acc_unique_hits.set_xlabel("training batch")
+        self.ax_acc_unique_hits.set_ylabel("n unique correct tokens")
+
+        self.ln_t_loss, self.ln_v_loss = self.ax_loss.plot([], self.t_loss, 'b-', [], [], 'r--')
+        self.ln_t_acc, self.ln_v_acc = self.ax_acc.plot([], [], 'b-', [], [], 'r--')
+        self.ln_t_acc_unique_hits, self.ln_v_acc_unique_hits = self.ax_acc_unique_hits.plot([], [], 'b-', [], [], 'r--')
+
+
+    def plot(self, _i):
+        t_idx = np.arange(len(self.t_loss))
+        v_idx = np.arange(len(self.v_loss)) * V_INTERVAL
+
+        self.ln_t_loss.set_data(t_idx, self.t_loss)
+        self.ln_v_loss.set_data(v_idx, self.v_loss)
+
+        self.ln_t_acc.set_data(t_idx, self.t_acc)
+        self.ln_v_acc.set_data(v_idx, self.v_acc)
+
+        self.ln_t_acc_unique_hits.set_data(t_idx, self.t_acc_unique_hits)
+        self.ln_v_acc_unique_hits.set_data(v_idx, self.v_acc_unique_hits)
+
+        self.ax_loss.relim()
+        self.ax_loss.autoscale()
+        self.ax_acc.relim()
+        self.ax_acc.autoscale()
+        self.ax_acc_unique_hits.relim()
+        self.ax_acc_unique_hits.autoscale()
+
+
+
+CHART_DATA = ChartData()
 
 
 class Transformer:
@@ -260,12 +323,21 @@ if __name__ == "__main__":
 
     print(f"Training a {param_count} parameter model")
 
-    opt = AdamW(params=params, lr=LR)
+    opt_proper = AdamW(params=params, lr=LR)
+    opt_warmup = AdamW(params=params, lr=LR * 10)
+    lr_sched = CosineAnnealingLR(opt_proper, 100000)
 
     # I'm a bit tired of setting DEBUG=2 manually when playing with the  metaparameters
     first_pass = True
 
+    ani = animation.FuncAnimation(CHART_DATA.fig, CHART_DATA.plot, interval=1000, blit=False)
+
+    plt.show(block=False)
+
+    opt = opt_warmup
     for i in range(N_BATCHES):
+        plt.pause(0.05)
+
         ctx = None
         if first_pass:
             ctx = Context(DEBUG=2)
@@ -273,6 +345,12 @@ if __name__ == "__main__":
             ctx = Context()
 
         with ctx:
+            if i > WARMUP_ROUNDS:
+                opt = opt_proper
+                lr_sched.step()
+            else:
+                print(f"WARMUP {i}/{WARMUP_ROUNDS}")
+
             batch = Tensor(next(df_it))
 
             t_loss, t_acc_cnt, t_acc_total, t_acc_hit_ids = train_step(model, batch, opt)
@@ -286,9 +364,16 @@ if __name__ == "__main__":
 
             t_hits_decoded = tok.decode(t_acc_hit_ids)
 
+            CHART_DATA.t_loss = np.append(CHART_DATA.t_loss, [t_loss.item()])
+            CHART_DATA.t_acc = np.append(CHART_DATA.t_acc, [t_acc.item()])
+            CHART_DATA.t_acc_unique_hits = np.append(CHART_DATA.t_acc_unique_hits, [len(t_acc_hit_ids)])
+
+
             print(f"Step {i+1:10} of {N_BATCHES} | T Loss: {t_loss.item():20.10} | T acc: {t_acc_cnt.item():6} of {t_acc_total:6} ({t_acc.item():20.10}) | T unique acc hits: {len(t_acc_hit_ids):4} {t_acc_hit_ids} {t_hits_decoded}")
+
+
+            if i % V_INTERVAL == 0:
             
-            if i % 50 == 0:
                 v_loss, v_acc_cnt, v_acc_total, v_acc_hit_ids = eval_step(model, v_data_batches)
 
                 v_acc = v_acc_cnt / v_acc_total
@@ -299,6 +384,10 @@ if __name__ == "__main__":
                 v_acc_hit_ids = sorted(list(t_acc_hit_ids))
 
                 v_hits_decoded = tok.decode(v_acc_hit_ids)
+
+                CHART_DATA.v_loss = np.append(CHART_DATA.v_loss, [v_loss])
+                CHART_DATA.v_acc = np.append(CHART_DATA.v_acc, [v_acc])
+                CHART_DATA.v_acc_unique_hits = np.append(CHART_DATA.v_acc_unique_hits, [len(v_acc_hit_ids)])
 
                 print(f"Step {i+1:10} of {N_BATCHES} | V Loss: {v_loss:20.10} | V acc: {v_acc_cnt:6} of {v_acc_total:6} ({v_acc:20.10}) | V unique acc hits: {len(v_acc_hit_ids):4} {v_acc_hit_ids} {v_hits_decoded}")
 

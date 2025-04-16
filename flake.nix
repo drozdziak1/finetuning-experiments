@@ -40,6 +40,7 @@
             black
             ipdb
             ipython
+            matplotlib
             mypy
             polars
             python-lsp-server
