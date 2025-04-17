@@ -8,7 +8,7 @@ from tinygrad.nn import LayerNorm, Linear, Embedding
 from tokenizers import Tokenizer
 from typing import List
 
-from lr_scheduler import CosineAnnealingLR
+from lr_scheduler import CosineAnnealingLR, LR_Scheduler
 
 import ipdb
 import matplotlib.pyplot as plt
@@ -29,10 +29,8 @@ N_V_BATCHES = 1
 V_INTERVAL = 50
 
 MINIBATCH_SIZE = 256
+
 CTX_SIZE = 64
-
-WARMUP_ROUNDS = MINIBATCH_SIZE * CTX_SIZE // 512
-
 NUM_BLOCKS = 12
 EMBED_DIM = 768
 NUM_HEADS = 12
@@ -40,6 +38,8 @@ FF_DIM = 4 * EMBED_DIM // 3
 DROPOUT = 0.1
 
 LR = 1e-4
+WARMUP_LR = 1e-7
+WARMUP_ROUNDS = 1_000
 
 EPSILON = 1e-5
 
@@ -53,6 +53,33 @@ random.seed(RNG_SEED)
 Tensor.manual_seed(RNG_SEED)
 
 NP_RNG = np.random.default_rng(seed=RNG_SEED)
+
+
+class LRSchedWithWarmup:
+    """
+    Shoves a bunch of warmup steps before the specisied Scheduler begins its first step 
+    """
+
+    def __init__(self, warmup_rounds: int, next_lr: float, opt: Optimizer, next_scheduler_ctor, *args, **kwargs):
+        self.warmup_rounds = warmup_rounds
+        self.next_lr = next_lr
+        self.opt = opt
+        self.cur_step = 0
+
+        self.next_scheduler_ctor = next_scheduler_ctor
+        self.next_scheduler_args = args
+        self.next_scheduler_kwargs = kwargs
+
+
+    def step(self, *args, **kwargs):
+        if self.cur_step == self.warmup_rounds:
+            self.opt.lr.assign(Tensor([self.next_lr], requires_grad=False, device=self.opt.device)).realize()
+            self.next_scheduler = self.next_scheduler_ctor(*self.next_scheduler_args, **self.next_scheduler_kwargs)
+
+        if self.cur_step >= self.warmup_rounds:
+            self.next_scheduler.step(*args, **kwargs)
+        
+        self.cur_step += 1
 
 
 class ChartData:
@@ -241,6 +268,7 @@ def dataset_minibatch_iter(df, tokenizer, batch_size, ctx_size=CTX_SIZE):
 @TinyJit
 def train_step(model: Transformer, batch: Tensor, opt: Optimizer):
     with Tensor.train():
+
         x = batch[:, :-1]
         y_gt = batch[:, 1:]
 
@@ -253,17 +281,23 @@ def train_step(model: Transformer, batch: Tensor, opt: Optimizer):
         opt.step()
 
         acc_scores = y_hat.argmax(-1) == y_gt
-        acc_cnt = acc_scores.sum()
+        acc_scores.requires_grad = False
 
-    acc_hit_ids =  acc_scores.where(y_gt, -1).reshape(-1)
+        acc_cnt = len(acc_scores.reshape(-1))
 
-    return loss, acc_cnt, len(acc_scores.reshape(-1)), acc_hit_ids
+        acc_hit_cnt = acc_scores.sum()
+        acc_hit_cnt.requires_grad = False
+
+        acc_hit_ids = acc_scores.where(y_gt, -1).reshape(-1)
+        acc_hit_ids.requires_grad = False
+
+        return loss, acc_hit_cnt, acc_cnt, acc_hit_ids.reshape(-1)
 
 @TinyJit
 def eval_step(model, batches):
     loss_mean = Tensor(0.0, requires_grad=False)
-    acc_cnt = Tensor(0, requires_grad=False)
-    acc_total = len(batches.reshape(-1)) - MINIBATCH_SIZE * N_V_BATCHES
+    acc_hit_cnt = Tensor(0, requires_grad=False)
+    acc_cnt = len(batches.reshape(-1)) - MINIBATCH_SIZE * N_V_BATCHES
 
     acc_hit_ids = Tensor.empty(0, CTX_SIZE, dtype=dtypes.int32)
 
@@ -276,12 +310,12 @@ def eval_step(model, batches):
         loss_mean = loss_mean + y_hat.sparse_categorical_crossentropy(y_gt).item() / len(batches)
 
         acc_scores = y_hat.argmax(-1) == y_gt
-        acc_cnt = acc_cnt + acc_scores.sum()
+        acc_hit_cnt = acc_hit_cnt + acc_scores.sum()
 
         acc_hit_ids = acc_hit_ids.cat(acc_scores.where(y_gt, -1), dim=0)
 
 
-    return loss_mean.numpy(), acc_cnt.numpy(), acc_total, acc_hit_ids.reshape(-1).numpy()
+    return loss_mean.numpy(), acc_hit_cnt.numpy(), acc_cnt, acc_hit_ids.reshape(-1).numpy()
 
 # @TinyJit
 def gen_step(model: Transformer, tokenizer: Tokenizer):
@@ -323,9 +357,8 @@ if __name__ == "__main__":
 
     print(f"Training a {param_count} parameter model")
 
-    opt_proper = AdamW(params=params, lr=LR)
-    opt_warmup = AdamW(params=params, lr=LR * 10)
-    lr_sched = CosineAnnealingLR(opt_proper, 100000)
+    opt = AdamW(params=params, lr=WARMUP_LR)
+    lr_sched = LRSchedWithWarmup(WARMUP_ROUNDS, LR, opt, CosineAnnealingLR, opt, 100000)
 
     # I'm a bit tired of setting DEBUG=2 manually when playing with the  metaparameters
     first_pass = True
@@ -334,7 +367,6 @@ if __name__ == "__main__":
 
     plt.show(block=False)
 
-    opt = opt_warmup
     for i in range(N_BATCHES):
         plt.pause(0.05)
 
@@ -345,17 +377,12 @@ if __name__ == "__main__":
             ctx = Context()
 
         with ctx:
-            if i > WARMUP_ROUNDS:
-                opt = opt_proper
-                lr_sched.step()
-            else:
-                print(f"WARMUP {i}/{WARMUP_ROUNDS}")
 
             batch = Tensor(next(df_it))
 
-            t_loss, t_acc_cnt, t_acc_total, t_acc_hit_ids = train_step(model, batch, opt)
+            t_loss, t_acc_hit_cnt, t_acc_cnt, t_acc_hit_ids = train_step(model, batch, opt)
 
-            t_acc = t_acc_cnt / t_acc_total
+            t_acc = t_acc_hit_cnt / t_acc_cnt
 
             t_acc_hit_ids = set(map(int, t_acc_hit_ids.numpy()))
             t_acc_hit_ids.remove(-1)
@@ -368,15 +395,17 @@ if __name__ == "__main__":
             CHART_DATA.t_acc = np.append(CHART_DATA.t_acc, [t_acc.item()])
             CHART_DATA.t_acc_unique_hits = np.append(CHART_DATA.t_acc_unique_hits, [len(t_acc_hit_ids)])
 
+            maybe_warmup = f"WARMUP {i+1}/{WARMUP_ROUNDS} | " if i < WARMUP_ROUNDS else ""
 
-            print(f"Step {i+1:10} of {N_BATCHES} | T Loss: {t_loss.item():20.10} | T acc: {t_acc_cnt.item():6} of {t_acc_total:6} ({t_acc.item():20.10}) | T unique acc hits: {len(t_acc_hit_ids):4} {t_acc_hit_ids} {t_hits_decoded}")
+            print(f"{maybe_warmup}Step {i+1:10} of {N_BATCHES} | T Loss: {t_loss.item():20.10} | T acc: {t_acc_hit_cnt.item():6} of {t_acc_cnt:6} ({t_acc.item():20.10}) | T unique acc hits: {len(t_acc_hit_ids):4} {t_acc_hit_ids} {t_hits_decoded}")
 
+            lr_sched.step()
 
             if i % V_INTERVAL == 0:
             
-                v_loss, v_acc_cnt, v_acc_total, v_acc_hit_ids = eval_step(model, v_data_batches)
+                v_loss, v_acc_hit_cnt, v_acc_cnt, v_acc_hit_ids = eval_step(model, v_data_batches)
 
-                v_acc = v_acc_cnt / v_acc_total
+                v_acc = v_acc_hit_cnt / v_acc_cnt
 
                 v_acc_hit_ids = set(map(int, v_acc_hit_ids))
                 v_acc_hit_ids.remove(-1)
@@ -389,7 +418,7 @@ if __name__ == "__main__":
                 CHART_DATA.v_acc = np.append(CHART_DATA.v_acc, [v_acc])
                 CHART_DATA.v_acc_unique_hits = np.append(CHART_DATA.v_acc_unique_hits, [len(v_acc_hit_ids)])
 
-                print(f"Step {i+1:10} of {N_BATCHES} | V Loss: {v_loss:20.10} | V acc: {v_acc_cnt:6} of {v_acc_total:6} ({v_acc:20.10}) | V unique acc hits: {len(v_acc_hit_ids):4} {v_acc_hit_ids} {v_hits_decoded}")
+                print(f"Step {i+1:10} of {N_BATCHES} | V Loss: {v_loss:20.10} | V acc: {v_acc_hit_cnt:6} of {v_acc_cnt:6} ({v_acc:20.10}) | V unique acc hits: {len(v_acc_hit_ids):4} {v_acc_hit_ids} {v_hits_decoded}")
 
             if i % 500 == 0:
                 gen_str = gen_step(model, tok)
