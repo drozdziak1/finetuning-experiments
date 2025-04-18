@@ -31,19 +31,19 @@ V_INTERVAL = 50
 MINIBATCH_SIZE = 256
 
 CTX_SIZE = 64
-NUM_BLOCKS = 12
-EMBED_DIM = 768
-NUM_HEADS = 12
+NUM_BLOCKS = 4
+EMBED_DIM = 96
+NUM_HEADS = 4
 FF_DIM = 4 * EMBED_DIM // 3
-DROPOUT = 0.1
+DROPOUT = 0
 
 LR = 1e-4
 WARMUP_LR = 1e-7
-WARMUP_ROUNDS = 1_000
+WARMUP_ROUNDS = 2_000
 
 EPSILON = 1e-5
 
-TOPK_K = 8
+TOPK_K = 16
 
 N_GEN_TOKENS = 8
 
@@ -73,7 +73,7 @@ class LRSchedWithWarmup:
 
     def step(self, *args, **kwargs):
         if self.cur_step == self.warmup_rounds:
-            self.opt.lr.assign(Tensor([self.next_lr], requires_grad=False, device=self.opt.device)).realize()
+            self.opt.lr.assign(Tensor([self.next_lr], requires_grad=False, device=self.opt.device, dtype=self.opt.lr.dtype)).realize()
             self.next_scheduler = self.next_scheduler_ctor(*self.next_scheduler_args, **self.next_scheduler_kwargs)
 
         if self.cur_step >= self.warmup_rounds:
@@ -247,7 +247,7 @@ def dataset_minibatch_iter(df, tokenizer, batch_size, ctx_size=CTX_SIZE):
     """
     each iteration yields a training batch
     """
-    df_iter = df.iter_rows()
+    df_iter = df.sample(fraction=1, shuffle=True, seed=RNG_SEED).iter_rows()
 
     while True:
         batch = []
@@ -274,7 +274,7 @@ def train_step(model: Transformer, batch: Tensor, opt: Optimizer):
 
         y_hat = model(x)
 
-        loss = y_hat.sparse_categorical_crossentropy(y_gt)
+        loss = y_hat.cast('float').sparse_categorical_crossentropy(y_gt)
 
         opt.zero_grad()
         loss.backward()
@@ -307,7 +307,7 @@ def eval_step(model, batches):
 
         y_hat = model(x)
 
-        loss_mean = loss_mean + y_hat.sparse_categorical_crossentropy(y_gt).item() / len(batches)
+        loss_mean = loss_mean + y_hat.cast('float').sparse_categorical_crossentropy(y_gt).item() / len(batches)
 
         acc_scores = y_hat.argmax(-1) == y_gt
         acc_hit_cnt = acc_hit_cnt + acc_scores.sum()
