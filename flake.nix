@@ -56,12 +56,14 @@
         devShell = pkgs.mkShell rec {
           buildInputs = with pkgs; [
             cudatoolkit
+            cudaPackages.cuda_cudart.dev
             python-env
             rocmPackages_6.clr
             rocmPackages_6.rocm-runtime
             rocmPackages_6.rocm-comgr
           ];
           nativeBuildInputs = buildInputs;
+          CUDA_PATH=pkgs.cudatoolkit.out;
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath buildInputs;
         };
       }
