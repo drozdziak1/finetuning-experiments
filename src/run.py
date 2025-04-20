@@ -10,6 +10,7 @@ from typing import List
 
 from lr_scheduler import CosineAnnealingLR, LR_Scheduler
 
+import datasets
 import ipdb
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -238,25 +239,25 @@ class TBlock:
 def load_tokenizer(model_name="gpt2"):
     return Tokenizer.from_pretrained(model_name)
 
-def load_dataset(data_path=FINEWEB_PATH):
-    df = polars.read_parquet(data_path, columns=['text'])
+def load_dataset():
+    ds = datasets.load_dataset("HuggingFaceFW/fineweb", "sample-10BT", split="train")
 
-    return df
+    ds_iter = ds.to_iterable_dataset().shuffle(buffer_size=10_000, seed=RNG_SEED).iter(1)
 
-def dataset_minibatch_iter(df, tokenizer, batch_size, ctx_size=CTX_SIZE):
+    return ds_iter
+
+def dataset_minibatch_iter(ds_iter, tokenizer, batch_size, ctx_size=CTX_SIZE):
     """
     each iteration yields a training batch
     """
-    df_iter = df.sample(fraction=1, shuffle=True, seed=RNG_SEED).iter_rows()
-
     while True:
         batch = []
 
-        buf = tokenizer.encode(next(df_iter)[0]).ids
+        buf = tokenizer.encode(next(ds_iter)["text"][0]).ids
         while len(batch) < batch_size:
             while len(buf) < ctx_size + 1:
                 buf += tokenizer.encode("<|endoftext|>").ids
-                buf += tokenizer.encode(next(df_iter)[0]).ids
+                buf += tokenizer.encode(next(ds_iter)["text"][0]).ids
 
             batch_item = buf[:ctx_size + 1]
             buf = buf[ctx_size + 1:]
@@ -321,7 +322,7 @@ def eval_step(model, batches):
 def gen_step(model: Transformer, tokenizer: Tokenizer):
     x = sum([tokenizer.encode("<|endoftext|>").ids for _ in range(CTX_SIZE)], [])
 
-    tokens = tokenizer.encode("What").ids
+    tokens = tokenizer.encode("What in").ids
 
     for i in range(N_GEN_TOKENS):
 
@@ -343,11 +344,11 @@ def gen_step(model: Transformer, tokenizer: Tokenizer):
 if __name__ == "__main__":
     tok = load_tokenizer()
 
-    df = load_dataset()
+    ds_it = load_dataset()
 
-    df_it = dataset_minibatch_iter(df, tok, MINIBATCH_SIZE)
+    batch_it = dataset_minibatch_iter(ds_it, tok, MINIBATCH_SIZE)
 
-    v_data_batches = Tensor(list(map(lambda _: next(df_it), range(N_V_BATCHES))), requires_grad=False)
+    v_data_batches = Tensor(list(map(lambda _: next(batch_it), range(N_V_BATCHES))), requires_grad=False)
 
     model = Transformer(CTX_SIZE, NUM_BLOCKS, EMBED_DIM, NUM_HEADS, FF_DIM, tok.get_vocab_size(), DROPOUT)
 
@@ -378,7 +379,7 @@ if __name__ == "__main__":
 
         with ctx:
 
-            batch = Tensor(next(df_it))
+            batch = Tensor(next(batch_it))
 
             t_loss, t_acc_hit_cnt, t_acc_cnt, t_acc_hit_ids = train_step(model, batch, opt)
 
