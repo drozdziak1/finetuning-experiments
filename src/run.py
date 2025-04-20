@@ -26,7 +26,6 @@ FINEWEB_PATH = "/home/drozdziak1/Documents/datasets/fineweb/000_00000.parquet"
 
 N_BATCHES = 16384 * 16384
 
-N_V_BATCHES = 1
 V_INTERVAL = 50
 
 GPUS = tuple(f"{Device.DEFAULT}:{i}" for i in range(getenv("GPUS", 2)))
@@ -43,7 +42,7 @@ DROPOUT = 0
 
 LR = 1e-4
 WARMUP_LR = 1e-7
-WARMUP_ROUNDS = 0
+WARMUP_ROUNDS = 2000
 
 EPSILON = 1e-5
 
@@ -256,8 +255,8 @@ def dataset_minibatch_iter(ds_iter, tokenizer, batch_size, ctx_size=CTX_SIZE):
     while True:
         batch = []
 
-        buf = tokenizer.encode(next(ds_iter)["text"][0]).ids
-        while len(batch) < batch_size:
+        bufs = [tokenizer.encode(next(ds_iter)["text"][0]).ids for _ in range(batch_size)]
+        for buf in bufs:
             while len(buf) < ctx_size + 1:
                 buf += tokenizer.encode("<|endoftext|>").ids
                 buf += tokenizer.encode(next(ds_iter)["text"][0]).ids
@@ -298,28 +297,26 @@ def train_step(model: Transformer, batch: Tensor, opt: Optimizer):
         return loss, acc_hit_cnt, acc_cnt, acc_hit_ids.reshape(-1)
 
 @TinyJit
-def eval_step(model, batches):
-    loss_mean = Tensor(0.0, requires_grad=False)
-    acc_hit_cnt = Tensor(0, requires_grad=False)
-    acc_cnt = len(batches.reshape(-1)) - MINIBATCH_SIZE * N_V_BATCHES
+def eval_step(model, batch):
+    x = batch[:, :-1].shard_(GPUS, axis=0)
+    y_gt = batch[:, 1:].shard_(GPUS, axis=0)
 
-    acc_hit_ids = Tensor.empty(0, CTX_SIZE, dtype=dtypes.int32)
+    y_hat = model(x)
 
-    for b in batches:
-        x = b[:, :-1]
-        y_gt = b[:, 1:]
+    loss = y_hat.cast('float').sparse_categorical_crossentropy(y_gt)
 
-        y_hat = model(x)
+    acc_scores = y_hat.argmax(-1) == y_gt
+    acc_scores.requires_grad = False
 
-        loss_mean = loss_mean + y_hat.cast('float').sparse_categorical_crossentropy(y_gt).item() / len(batches)
+    acc_cnt = len(acc_scores.reshape(-1))
 
-        acc_scores = y_hat.argmax(-1) == y_gt
-        acc_hit_cnt = acc_hit_cnt + acc_scores.sum()
+    acc_hit_cnt = acc_scores.sum()
+    acc_hit_cnt.requires_grad = False
 
-        acc_hit_ids = acc_hit_ids.cat(acc_scores.where(y_gt, -1), dim=0)
+    acc_hit_ids = acc_scores.where(y_gt, -1).reshape(-1)
+    acc_hit_ids.requires_grad = False
 
-
-    return loss_mean.numpy(), acc_hit_cnt.numpy(), acc_cnt, acc_hit_ids.reshape(-1).numpy()
+    return loss, acc_hit_cnt, acc_cnt, acc_hit_ids.reshape(-1)
 
 # @TinyJit
 def gen_step(model: Transformer, tokenizer: Tokenizer):
@@ -332,13 +329,13 @@ def gen_step(model: Transformer, tokenizer: Tokenizer):
         for j in range(len(tokens)):
             x[j] = tokens[j]
 
-        ys = model(Tensor(x, requires_grad=False).reshape(1, -1))
+        ys = model(Tensor(x, requires_grad=False).reshape(1, -1).shard_(GPUS, axis=1)).numpy()
 
-        last_y = ys[0][len(tokens) - 1]
+        last_y = ys[0, len(tokens) - 1]
 
-        _values, topk = last_y.topk(TOPK_K)
+        topk = last_y.argpartition(-TOPK_K)[-TOPK_K:]
 
-        tok_id = NP_RNG.choice(topk.numpy())
+        tok_id = NP_RNG.choice(topk)
 
         tokens += [tok_id]
 
@@ -351,7 +348,7 @@ if __name__ == "__main__":
 
     batch_it = dataset_minibatch_iter(ds_it, tok, MINIBATCH_SIZE)
 
-    v_data_batches = Tensor(list(map(lambda _: next(batch_it), range(N_V_BATCHES))), requires_grad=False).shard_(GPUS, axis=1)
+    v_data_batch = Tensor(next(batch_it), requires_grad=False)
 
     model = Transformer(CTX_SIZE, NUM_BLOCKS, EMBED_DIM, NUM_HEADS, FF_DIM, tok.get_vocab_size(), DROPOUT)
 
@@ -408,29 +405,29 @@ if __name__ == "__main__":
 
             lr_sched.step()
 
-            # if i % V_INTERVAL == 0:
+            if i % V_INTERVAL == 0:
             
-            #     v_loss, v_acc_hit_cnt, v_acc_cnt, v_acc_hit_ids = eval_step(model, v_data_batches)
+                v_loss, v_acc_hit_cnt, v_acc_cnt, v_acc_hit_ids = eval_step(model, v_data_batch)
 
-            #     v_acc = v_acc_hit_cnt / v_acc_cnt
+                v_acc = v_acc_hit_cnt / v_acc_cnt
 
-            #     v_acc_hit_ids = set(map(int, v_acc_hit_ids))
-            #     v_acc_hit_ids.remove(-1)
+                v_acc_hit_ids = set(map(int, v_acc_hit_ids.numpy()))
+                v_acc_hit_ids.remove(-1)
 
-            #     v_acc_hit_ids = sorted(list(t_acc_hit_ids))
+                v_acc_hit_ids = sorted(list(t_acc_hit_ids))
 
-            #     v_hits_decoded = tok.decode(v_acc_hit_ids)
+                v_hits_decoded = tok.decode(v_acc_hit_ids)
 
-            #     CHART_DATA.v_loss = np.append(CHART_DATA.v_loss, [v_loss])
-            #     CHART_DATA.v_acc = np.append(CHART_DATA.v_acc, [v_acc])
-            #     CHART_DATA.v_acc_unique_hits = np.append(CHART_DATA.v_acc_unique_hits, [len(v_acc_hit_ids)])
+                CHART_DATA.v_loss = np.append(CHART_DATA.v_loss, [v_loss.item()])
+                CHART_DATA.v_acc = np.append(CHART_DATA.v_acc, [v_acc.item()])
+                CHART_DATA.v_acc_unique_hits = np.append(CHART_DATA.v_acc_unique_hits, [len(v_acc_hit_ids)])
 
-            #     print(f"Step {i+1:10} of {N_BATCHES} | V Loss: {v_loss:20.10} | V acc: {v_acc_hit_cnt:6} of {v_acc_cnt:6} ({v_acc:20.10}) | V unique acc hits: {len(v_acc_hit_ids):4} {v_acc_hit_ids} {v_hits_decoded}")
+                print(f"Step {i+1:10} of {N_BATCHES} | V Loss: {v_loss.item():20.10} | V acc: {v_acc_hit_cnt.item():6} of {v_acc_cnt:6} ({v_acc.item():20.10}) | V unique acc hits: {len(v_acc_hit_ids):4} {v_acc_hit_ids} {v_hits_decoded}")
 
-            # if i % 500 == 0:
-            #     gen_str = gen_step(model, tok)
+            if i % 500 == 0:
+                gen_str = gen_step(model, tok)
 
-            #     print(f"Gen: {gen_str}")
+                print(f"Gen: {gen_str}")
 
             sys.stdout.flush()
 
