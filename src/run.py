@@ -41,8 +41,8 @@ FF_DIM = 4 * EMBED_DIM // 3
 DROPOUT = 0
 
 LR = 1e-4
-WARMUP_LR = 1e-7
-WARMUP_ROUNDS = 2000
+WARMUP_LR = 1e-6
+WARMUP_ROUNDS = 2_000
 
 EPSILON = 1e-5
 
@@ -69,14 +69,23 @@ class LRSchedWithWarmup:
         self.opt = opt
         self.cur_step = 0
 
+        self.start_lr = self.opt.lr.item()
+        self.step_value = (self.next_lr - self.start_lr) / (self.warmup_rounds + EPSILON)
+
         self.next_scheduler_ctor = next_scheduler_ctor
         self.next_scheduler_args = args
         self.next_scheduler_kwargs = kwargs
 
 
     def step(self, *args, **kwargs):
+        if self.cur_step <= self.warmup_rounds:
+            new_lr = self.opt.lr + self.step_value
+            new_lr.requires_grad = False
+
+            self.opt.lr.assign(new_lr)
+            
         if self.cur_step == self.warmup_rounds:
-            self.opt.lr.assign(Tensor([self.next_lr], requires_grad=False, device=self.opt.device, dtype=self.opt.lr.dtype)).realize()
+            self.opt.lr.assign(Tensor([self.next_lr], requires_grad=False, device=self.opt.device, dtype=self.opt.lr.dtype))
             self.next_scheduler = self.next_scheduler_ctor(*self.next_scheduler_args, **self.next_scheduler_kwargs)
 
         if self.cur_step >= self.warmup_rounds:
