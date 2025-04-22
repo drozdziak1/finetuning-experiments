@@ -37,7 +37,8 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "tinygrad-src": "tinygrad-src"
       }
     },
     "systems": {
@@ -52,6 +53,22 @@
       "original": {
         "owner": "nix-systems",
         "repo": "default",
+        "type": "github"
+      }
+    },
+    "tinygrad-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1745351069,
+        "narHash": "sha256-rOQG0YYhnA23Q0ZpuQqk2krF/IvnkjYbSQaYeJuCpZQ=",
+        "owner": "tinygrad",
+        "repo": "tinygrad",
+        "rev": "d1f6701eb76e0f2ff023ae150ef4409dbb04235d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "tinygrad",
+        "repo": "tinygrad",
         "type": "github"
       }
     }
