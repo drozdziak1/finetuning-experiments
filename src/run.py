@@ -20,6 +20,7 @@ import random
 import signal
 import sys
 import threading
+import time
 
 
 FINEWEB_PATH = "/home/drozdziak1/Documents/datasets/fineweb/000_00000.parquet"
@@ -31,17 +32,17 @@ V_INTERVAL = 50
 GPUS = tuple(f"{Device.DEFAULT}:{i}" for i in range(getenv("GPUS", 2)))
 
 
-MINIBATCH_SIZE = 1024
+MINIBATCH_SIZE = 64
 
-CTX_SIZE = 64
-NUM_BLOCKS = 4
-EMBED_DIM = 96
-NUM_HEADS = 4
+CTX_SIZE = 512
+NUM_BLOCKS = 12
+EMBED_DIM = 768
+NUM_HEADS = 12
 FF_DIM = 4 * EMBED_DIM // 3
 DROPOUT = 0
 
 LR = 1e-4
-WARMUP_LR = 1e-6
+WARMUP_LR = 0
 WARMUP_ROUNDS = 2_000
 
 EPSILON = 1e-5
@@ -70,7 +71,6 @@ class LRSchedWithWarmup:
         self.cur_step = 0
 
         self.start_lr = self.opt.lr.item()
-        self.step_value = (self.next_lr - self.start_lr) / (self.warmup_rounds + EPSILON)
 
         self.next_scheduler_ctor = next_scheduler_ctor
         self.next_scheduler_args = args
@@ -79,10 +79,9 @@ class LRSchedWithWarmup:
 
     def step(self, *args, **kwargs):
         if self.cur_step <= self.warmup_rounds:
-            new_lr = self.opt.lr + self.step_value
-            new_lr.requires_grad = False
+            new_lr = (self.next_lr - self.start_lr) * self.cur_step / self.warmup_rounds
 
-            self.opt.lr.assign(new_lr)
+            self.opt.lr.assign(Tensor([new_lr], requires_grad=False), device=self.opt.device, dtype=self.opt.lr.dtype)
             
         if self.cur_step == self.warmup_rounds:
             self.opt.lr.assign(Tensor([self.next_lr], requires_grad=False, device=self.opt.device, dtype=self.opt.lr.dtype))
@@ -145,6 +144,14 @@ class ChartData:
 
 
 CHART_DATA = ChartData()
+
+def save_plot_on_exit(i, _whatever):
+    CHART_DATA.fig.savefig("last_plot.png")
+    plt.close(CHART_DATA.fig)
+    sys.exit(1)
+
+signal.signal(signal.SIGTERM, save_plot_on_exit)
+signal.signal(signal.SIGINT, save_plot_on_exit)
 
 
 class Transformer:
@@ -251,9 +258,10 @@ def load_tokenizer(model_name="gpt2"):
     return Tokenizer.from_pretrained(model_name)
 
 def load_dataset():
-    ds = datasets.load_dataset("HuggingFaceFW/fineweb", "sample-10BT", split="train")
+    ds = datasets.load_dataset("HuggingFaceFW/fineweb", "sample-100BT", split="train", streaming=True)
 
-    ds_iter = ds.to_iterable_dataset().shuffle(buffer_size=10_000, seed=RNG_SEED).iter(1)
+    # ds_iter = ds.to_iterable_dataset().shuffle(buffer_size=10_000, seed=RNG_SEED).iter(1)
+    ds_iter = ds.shuffle(buffer_size=10_000, seed=RNG_SEED).iter(1)
 
     return ds_iter
 
@@ -286,7 +294,9 @@ def train_step(model: Transformer, batch: Tensor, opt: Optimizer):
 
         y_hat = model(x)
 
-        loss = y_hat.cast('float').sparse_categorical_crossentropy(y_gt)
+        losses = y_hat.sparse_categorical_crossentropy(y_gt, reduction = "none")
+
+        loss = losses.mean() # Internally, x-entropy implementation is not too fp16-friendly, so we do the mean on our own
 
         opt.zero_grad()
         loss.backward()
@@ -312,7 +322,9 @@ def eval_step(model, batch):
 
     y_hat = model(x)
 
-    loss = y_hat.cast('float').sparse_categorical_crossentropy(y_gt)
+    losses = y_hat.sparse_categorical_crossentropy(y_gt, reduction = "none")
+
+    loss = losses.mean()
 
     acc_scores = y_hat.argmax(-1) == y_gt
     acc_scores.requires_grad = False
@@ -329,7 +341,7 @@ def eval_step(model, batch):
 
 # @TinyJit
 def gen_step(model: Transformer, tokenizer: Tokenizer):
-    x = sum([tokenizer.encode("<|endoftext|>").ids for _ in range(CTX_SIZE)], [])
+    x = tokenizer.encode("<|endoftext|>").ids * CTX_SIZE
 
     tokens = tokenizer.encode("What in").ids
 
@@ -338,7 +350,7 @@ def gen_step(model: Transformer, tokenizer: Tokenizer):
         for j in range(len(tokens)):
             x[j] = tokens[j]
 
-        ys = model(Tensor(x, requires_grad=False).reshape(1, -1).shard_(GPUS, axis=1)).numpy()
+        ys = model(Tensor(x, requires_grad=False).unsqueeze(0).shard_(GPUS, axis=1)).numpy()
 
         last_y = ys[0, len(tokens) - 1]
 
@@ -348,7 +360,7 @@ def gen_step(model: Transformer, tokenizer: Tokenizer):
 
         tokens += [tok_id]
 
-    return tokenizer.decode(x)
+    return tokenizer.decode(tokens)
 
 if __name__ == "__main__":
     tok = load_tokenizer()
@@ -391,7 +403,12 @@ if __name__ == "__main__":
 
         with ctx:
 
-            batch = Tensor(next(batch_it))
+            try:
+                batch = Tensor(next(batch_it))
+            except StopIteration:
+                print(f"Ran out of batches for training! idling to preserve graph...")
+                while True:
+                    time.sleep(36_000) # 10h
 
             t_loss, t_acc_hit_cnt, t_acc_cnt, t_acc_hit_ids = train_step(model, batch, opt)
 
