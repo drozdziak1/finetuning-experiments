@@ -29,21 +29,22 @@ N_BATCHES = 16384 * 16384
 
 V_INTERVAL = 50
 
-GPUS = tuple(f"{Device.DEFAULT}:{i}" for i in range(getenv("GPUS", 2)))
+GPUS = tuple(f"{Device.DEFAULT}:{i}" for i in range(int(getenv("GPUS", 2))))
 
+BATCH_SIZE = 4
 
-MINIBATCH_SIZE = 64
+MINIBATCH_SIZE = 512
 
-CTX_SIZE = 512
-NUM_BLOCKS = 12
-EMBED_DIM = 768
-NUM_HEADS = 12
+CTX_SIZE = 64
+NUM_BLOCKS = 4
+EMBED_DIM = 96
+NUM_HEADS = 4
 FF_DIM = 4 * EMBED_DIM // 3
 DROPOUT = 0
 
-LR = 1e-4
+LR = 3e-4
 WARMUP_LR = 0
-WARMUP_ROUNDS = 2_000
+WARMUP_ROUNDS = 200
 
 EPSILON = 1e-5
 
@@ -70,7 +71,7 @@ class LRSchedWithWarmup:
         self.opt = opt
         self.cur_step = 0
 
-        self.start_lr = self.opt.lr.item()
+        self.start_lr = self.opt.lr
 
         self.next_scheduler_ctor = next_scheduler_ctor
         self.next_scheduler_args = args
@@ -81,7 +82,7 @@ class LRSchedWithWarmup:
         if self.cur_step <= self.warmup_rounds:
             new_lr = (self.next_lr - self.start_lr) * self.cur_step / self.warmup_rounds
 
-            self.opt.lr.assign(Tensor([new_lr], requires_grad=False), device=self.opt.device, dtype=self.opt.lr.dtype)
+            self.opt.lr.assign(new_lr)
             
         if self.cur_step == self.warmup_rounds:
             self.opt.lr.assign(Tensor([self.next_lr], requires_grad=False, device=self.opt.device, dtype=self.opt.lr.dtype))
@@ -146,12 +147,16 @@ class ChartData:
 CHART_DATA = ChartData()
 
 def save_plot_on_exit(i, _whatever):
-    CHART_DATA.fig.savefig("last_plot.png")
-    plt.close(CHART_DATA.fig)
+    try:
+        CHART_DATA.fig.savefig("last_plot.png")
+        plt.close(CHART_DATA.fig)
+    except:
+        pass
+
     sys.exit(1)
 
-signal.signal(signal.SIGTERM, save_plot_on_exit)
-signal.signal(signal.SIGINT, save_plot_on_exit)
+# signal.signal(signal.SIGTERM, save_plot_on_exit)
+# signal.signal(signal.SIGINT, save_plot_on_exit)
 
 
 class Transformer:
@@ -258,10 +263,10 @@ def load_tokenizer(model_name="gpt2"):
     return Tokenizer.from_pretrained(model_name)
 
 def load_dataset():
-    ds = datasets.load_dataset("HuggingFaceFW/fineweb", "sample-100BT", split="train", streaming=True)
+    # ds = datasets.load_dataset("HuggingFaceFW/fineweb", "sample-100BT", split="train")
+    ds = datasets.load_dataset("HuggingFaceFW/fineweb", data_files="sample/100BT/000_00000.parquet", split="train", )
 
-    # ds_iter = ds.to_iterable_dataset().shuffle(buffer_size=10_000, seed=RNG_SEED).iter(1)
-    ds_iter = ds.shuffle(buffer_size=10_000, seed=RNG_SEED).iter(1)
+    ds_iter = ds.to_iterable_dataset().shuffle(buffer_size=10_000, seed=RNG_SEED).iter(1)
 
     return ds_iter
 
@@ -286,36 +291,46 @@ def dataset_minibatch_iter(ds_iter, tokenizer, batch_size, ctx_size=CTX_SIZE):
         yield batch
 
 @TinyJit
+@Tensor.train()
 def train_step(model: Transformer, batch: Tensor, opt: Optimizer):
-    with Tensor.train():
+    total_loss = Tensor(0.0, requires_grad=False).shard_(GPUS)
+    total_acc_hit_cnt = Tensor(0, requires_grad=False).shard_(GPUS)
 
-        x = batch[:, :-1].shard_(GPUS, axis=0)
-        y_gt = batch[:, 1:].shard_(GPUS, axis=0)
+    total_acc_hit_ids = Tensor.zeros(model.vocab_size + 1).shard_(GPUS)
+
+    acc_cnt = BATCH_SIZE * MINIBATCH_SIZE * CTX_SIZE
+
+    opt.zero_grad()
+    for minibatch in batch:
+        x = minibatch[:, :-1].shard_(GPUS, axis=0)
+        y_gt = minibatch[:, 1:].shard_(GPUS, axis=0)
 
         y_hat = model(x)
 
         losses = y_hat.sparse_categorical_crossentropy(y_gt, reduction = "none")
 
-        loss = losses.mean() # Internally, x-entropy implementation is not too fp16-friendly, so we do the mean on our own
+        loss = losses.mean() / BATCH_SIZE # Internally, x-entropy implementation is not too fp16-friendly, so we do the mean on our own
 
-        opt.zero_grad()
         loss.backward()
-        opt.step()
+
+        total_loss = total_loss + loss
 
         acc_scores = y_hat.argmax(-1) == y_gt
         acc_scores.requires_grad = False
 
-        acc_cnt = len(acc_scores.reshape(-1))
+        total_acc_hit_cnt = total_acc_hit_cnt + acc_scores.sum()
 
-        acc_hit_cnt = acc_scores.sum()
-        acc_hit_cnt.requires_grad = False
+        total_acc_hit_ids = total_acc_hit_ids + acc_scores.where(y_gt, model.vocab_size).reshape(-1).one_hot(model.vocab_size + 1).sum(0)
 
-        acc_hit_ids = acc_scores.where(y_gt, -1).reshape(-1)
-        acc_hit_ids.requires_grad = False
+    opt.step()
 
-        return loss, acc_hit_cnt, acc_cnt, acc_hit_ids.reshape(-1)
+    arange = Tensor.arange(0, model.vocab_size).shard_(GPUS)
 
-@TinyJit
+    total_acc_hit_ids = (total_acc_hit_ids[:-1] > 0).where(arange, -1)
+
+    return total_loss, total_acc_hit_cnt, acc_cnt, total_acc_hit_ids 
+
+# @TinyJit
 def eval_step(model, batch):
     x = batch[:, :-1].shard_(GPUS, axis=0)
     y_gt = batch[:, 1:].shard_(GPUS, axis=0)
@@ -367,9 +382,9 @@ if __name__ == "__main__":
 
     ds_it = load_dataset()
 
-    batch_it = dataset_minibatch_iter(ds_it, tok, MINIBATCH_SIZE)
+    minibatch_it = dataset_minibatch_iter(ds_it, tok, MINIBATCH_SIZE)
 
-    v_data_batch = Tensor(next(batch_it), requires_grad=False)
+    v_data_batch = Tensor(next(minibatch_it), requires_grad=False)
 
     model = Transformer(CTX_SIZE, NUM_BLOCKS, EMBED_DIM, NUM_HEADS, FF_DIM, tok.get_vocab_size(), DROPOUT)
 
@@ -404,7 +419,7 @@ if __name__ == "__main__":
         with ctx:
 
             try:
-                batch = Tensor(next(batch_it))
+                batch = Tensor([next(minibatch_it) for _ in range(BATCH_SIZE)])
             except StopIteration:
                 print(f"Ran out of batches for training! idling to preserve graph...")
                 while True:
@@ -412,22 +427,24 @@ if __name__ == "__main__":
 
             t_loss, t_acc_hit_cnt, t_acc_cnt, t_acc_hit_ids = train_step(model, batch, opt)
 
-            t_acc = t_acc_hit_cnt / t_acc_cnt
-
-            t_acc_hit_ids = set(map(int, t_acc_hit_ids.numpy()))
+            t_acc_hit_ids = set(t_acc_hit_ids.tolist())
             t_acc_hit_ids.remove(-1)
+
+            t_acc_hit_cnt = t_acc_hit_cnt.item()
+
+            t_acc = t_acc_hit_cnt / t_acc_cnt
 
             t_acc_hit_ids = sorted(list(t_acc_hit_ids))
 
             t_hits_decoded = tok.decode(t_acc_hit_ids)
 
             CHART_DATA.t_loss = np.append(CHART_DATA.t_loss, [t_loss.item()])
-            CHART_DATA.t_acc = np.append(CHART_DATA.t_acc, [t_acc.item()])
+            CHART_DATA.t_acc = np.append(CHART_DATA.t_acc, [t_acc])
             CHART_DATA.t_acc_unique_hits = np.append(CHART_DATA.t_acc_unique_hits, [len(t_acc_hit_ids)])
 
             maybe_warmup = f"WARMUP {i+1}/{WARMUP_ROUNDS} | " if i < WARMUP_ROUNDS else ""
 
-            print(f"{maybe_warmup}Step {i+1:10} of {N_BATCHES} | T Loss: {t_loss.item():20.10} | T acc: {t_acc_hit_cnt.item():6} of {t_acc_cnt:6} ({t_acc.item():20.10}) | T unique acc hits: {len(t_acc_hit_ids):4} {t_acc_hit_ids} {t_hits_decoded}")
+            print(f"{maybe_warmup}Step {i+1:10} of {N_BATCHES} | T Loss: {t_loss.item():20.10} | T acc: {t_acc_hit_cnt:6} of {t_acc_cnt:6} ({t_acc:20.10}) | T unique acc hits: {len(t_acc_hit_ids):4} {t_acc_hit_ids} {t_hits_decoded}")
 
             lr_sched.step()
 
