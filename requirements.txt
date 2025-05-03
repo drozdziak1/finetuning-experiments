@@ -1,4 +1,4 @@
-tinygrad @ git+https://tinygrad/tinygrad
+tinygrad @ git+https://github.com/tinygrad/tinygrad.git
 datasets
 tokenizers
 matplotlib
