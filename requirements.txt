@@ -1,6 +1,7 @@
-tinygrad @ git+https://github.com/tinygrad/tinygrad.git
-numpy
-ipdb
 datasets
-tokenizers
+ipdb
 matplotlib
+numpy
+polars
+tinygrad @ git+https://github.com/tinygrad/tinygrad.git
+tokenizers
