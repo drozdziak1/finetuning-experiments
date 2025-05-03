@@ -1,0 +1,4 @@
+tinygrad @ git+https://tinygrad/tinygrad
+datasets
+tokenizers
+matplotlib
