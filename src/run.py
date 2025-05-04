@@ -146,18 +146,29 @@ class ChartData:
 
 CHART_DATA = ChartData()
 
-def save_plot_on_exit(i, _whatever):
+def save_plot():
     try:
-        CHART_DATA.fig.savefig("last_plot.png")
+        plot_fname = "last_plot.png"
+        print(f"Saving plot to {plot_fname}...")
+
+        CHART_DATA.fig.savefig(plot_fname)
         plt.close(CHART_DATA.fig)
-    except:
-        pass
 
-    sys.exit(1)
+    except Exception as e:
+        print(f"Could not save plot:\n{e}")
 
-# signal.signal(signal.SIGTERM, save_plot_on_exit)
-# signal.signal(signal.SIGINT, save_plot_on_exit)
+QUITTING = False
 
+def sig_handler(_i, _whatever):
+    global QUITTING
+    if QUITTING:
+        print("Quitting now!")
+        sys.exit(1)
+    print(f"Cleaning up... (Send SIGINT or SIGTERM again to quit now)")
+    QUITTING = True
+
+signal.signal(signal.SIGINT, sig_handler)
+signal.signal(signal.SIGTERM, sig_handler)
 
 class Transformer:
     def __init__(self, ctx_size, num_blocks, embed_dim, num_heads, ff_dim, vocab_size, dropout):
@@ -263,8 +274,8 @@ def load_tokenizer(model_name="gpt2"):
     return Tokenizer.from_pretrained(model_name)
 
 def load_dataset():
-    # ds = datasets.load_dataset("HuggingFaceFW/fineweb", "sample-100BT", split="train")
-    ds = datasets.load_dataset("HuggingFaceFW/fineweb", data_files="sample/100BT/000_00000.parquet", split="train", )
+    ds = datasets.load_dataset("HuggingFaceFW/fineweb", "sample-100BT", split="train")
+    # ds = datasets.load_dataset("HuggingFaceFW/fineweb", data_files="sample/100BT/000_00000.parquet", split="train", )
 
     ds_iter = ds.to_iterable_dataset().shuffle(buffer_size=10_000, seed=RNG_SEED).iter(1)
 
@@ -424,6 +435,9 @@ if __name__ == "__main__":
     for i in range(N_BATCHES):
         plt.pause(0.05)
 
+        if QUITTING:
+            break
+
         ctx = None
         if first_pass:
             ctx = Context(DEBUG=2)
@@ -434,10 +448,10 @@ if __name__ == "__main__":
 
             try:
                 batch = Tensor([next(minibatch_it) for _ in range(BATCH_SIZE)])
-            except StopIteration:
-                print(f"Ran out of batches for training! idling to preserve graph...")
-                while True:
-                    time.sleep(36_000) # 10h
+            except Exception as e:
+                print(f"Ran out of batches for training! Cleaning up...")
+                save_plot()
+                sys.exit(1)
 
             t_loss, t_acc_hit_cnt, t_acc_cnt, t_acc_hit_ids = train_step(model, batch, opt)
 
@@ -486,3 +500,5 @@ if __name__ == "__main__":
             sys.stdout.flush()
 
         first_pass = False
+
+save_plot()
