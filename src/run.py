@@ -33,7 +33,7 @@ GPUS = tuple(f"{Device.DEFAULT}:{i}" for i in range(int(getenv("GPUS", 2))))
 
 BATCH_SIZE = 4
 
-MINIBATCH_SIZE = 512
+MINIBATCH_SIZE = 1024
 
 CTX_SIZE = 64
 NUM_BLOCKS = 4
@@ -42,7 +42,7 @@ NUM_HEADS = 4
 FF_DIM = 4 * EMBED_DIM // 3
 DROPOUT = 0
 
-LR = 3e-4
+LR = 1.5e-4
 WARMUP_LR = 0
 WARMUP_ROUNDS = 200
 
@@ -62,7 +62,7 @@ NP_RNG = np.random.default_rng(seed=RNG_SEED)
 
 class LRSchedWithWarmup:
     """
-    Shoves a bunch of warmup steps before the specisied Scheduler begins its first step 
+    Shoves a bunch of warmup steps before the specisied Scheduler begins its first step
     """
 
     def __init__(self, warmup_rounds: int, next_lr: float, opt: Optimizer, next_scheduler_ctor, *args, **kwargs):
@@ -83,14 +83,14 @@ class LRSchedWithWarmup:
             new_lr = (self.next_lr - self.start_lr) * self.cur_step / self.warmup_rounds
 
             self.opt.lr.assign(new_lr)
-            
+
         if self.cur_step == self.warmup_rounds:
             self.opt.lr.assign(Tensor([self.next_lr], requires_grad=False, device=self.opt.device, dtype=self.opt.lr.dtype))
             self.next_scheduler = self.next_scheduler_ctor(*self.next_scheduler_args, **self.next_scheduler_kwargs)
 
         if self.cur_step >= self.warmup_rounds:
             self.next_scheduler.step(*args, **kwargs)
-        
+
         self.cur_step += 1
 
 
@@ -290,21 +290,10 @@ def dataset_minibatch_iter(ds_iter, tokenizer, batch_size, ctx_size=CTX_SIZE):
 
         yield batch
 
-@TinyJit
 @Tensor.train()
 def train_step(model: Transformer, batch: Tensor, opt: Optimizer):
-    total_loss = Tensor(0.0, requires_grad=False).shard_(GPUS)
-    total_acc_hit_cnt = Tensor(0, requires_grad=False).shard_(GPUS)
-
-    total_acc_hit_ids = Tensor.zeros(model.vocab_size + 1).shard_(GPUS)
-
-    acc_cnt = BATCH_SIZE * MINIBATCH_SIZE * CTX_SIZE
-
-    opt.zero_grad()
-    for minibatch in batch:
-        x = minibatch[:, :-1].shard_(GPUS, axis=0)
-        y_gt = minibatch[:, 1:].shard_(GPUS, axis=0)
-
+    @TinyJit
+    def mb_step(model, x, y_gt):
         y_hat = model(x)
 
         losses = y_hat.sparse_categorical_crossentropy(y_gt, reduction = "none")
@@ -313,22 +302,47 @@ def train_step(model: Transformer, batch: Tensor, opt: Optimizer):
 
         loss.backward()
 
-        total_loss = total_loss + loss
-
         acc_scores = y_hat.argmax(-1) == y_gt
         acc_scores.requires_grad = False
 
-        total_acc_hit_cnt = total_acc_hit_cnt + acc_scores.sum()
+        acc_hits_by_id = acc_scores.where(y_gt, model.vocab_size).one_hot(model.vocab_size + 1).sum(axis=(0, 1), dtype=dtypes.int32)
+        acc_hits_by_id.requires_grad = False
 
-        total_acc_hit_ids = total_acc_hit_ids + acc_scores.where(y_gt, model.vocab_size).reshape(-1).one_hot(model.vocab_size + 1).sum(0)
+        return loss, acc_scores, acc_hits_by_id
+
+    total_loss = Tensor(0.0, requires_grad=False).to_(GPUS)
+    total_acc_hit_cnt = Tensor(0, requires_grad=False, dtype=dtypes.int32).to_(GPUS)
+
+    total_acc_hits_by_id = Tensor.zeros(model.vocab_size + 1, requires_grad=False, dtype=dtypes.int32).shard_(GPUS, axis=0)
+
+    # For assigning token ID value during set construction
+    arange_helper = Tensor.arange(0, model.vocab_size + 1, requires_grad=False).shard_(GPUS, axis=0)
+
+    acc_cnt = BATCH_SIZE * MINIBATCH_SIZE * CTX_SIZE
+
+    opt.zero_grad()
+
+    for idx, minibatch in enumerate(batch):
+
+        x = minibatch[:, :-1].shard_(GPUS, axis=0)
+        y_gt = minibatch[:, 1:].shard_(GPUS, axis=0)
+
+        loss, acc_scores, acc_hits_by_id = mb_step(model, x, y_gt)
+
+        total_loss = total_loss + loss
+
+        total_acc_hit_cnt = total_acc_hit_cnt + acc_scores.sum(dtype=dtypes.int32)
+        total_acc_hits_by_id = total_acc_hits_by_id + acc_hits_by_id
+
 
     opt.step()
 
-    arange = Tensor.arange(0, model.vocab_size).shard_(GPUS)
 
-    total_acc_hit_ids = (total_acc_hit_ids[:-1] > 0).where(arange, -1)
+    total_acc_hits_by_id = (total_acc_hits_by_id > 0).where(arange_helper, model.vocab_size)
+    total_acc_hits_by_id = set(total_acc_hits_by_id.tolist())
+    total_acc_hits_by_id.remove(model.vocab_size)
 
-    return total_loss, total_acc_hit_cnt, acc_cnt, total_acc_hit_ids 
+    return total_loss.item(), total_acc_hit_cnt.item(), acc_cnt, total_acc_hits_by_id
 
 # @TinyJit
 def eval_step(model, batch):
@@ -427,10 +441,7 @@ if __name__ == "__main__":
 
             t_loss, t_acc_hit_cnt, t_acc_cnt, t_acc_hit_ids = train_step(model, batch, opt)
 
-            t_acc_hit_ids = set(t_acc_hit_ids.tolist())
-            t_acc_hit_ids.remove(-1)
-
-            t_acc_hit_cnt = t_acc_hit_cnt.item()
+            t_acc_hit_cnt = t_acc_hit_cnt
 
             t_acc = t_acc_hit_cnt / t_acc_cnt
 
@@ -438,18 +449,18 @@ if __name__ == "__main__":
 
             t_hits_decoded = tok.decode(t_acc_hit_ids)
 
-            CHART_DATA.t_loss = np.append(CHART_DATA.t_loss, [t_loss.item()])
+            CHART_DATA.t_loss = np.append(CHART_DATA.t_loss, [t_loss])
             CHART_DATA.t_acc = np.append(CHART_DATA.t_acc, [t_acc])
             CHART_DATA.t_acc_unique_hits = np.append(CHART_DATA.t_acc_unique_hits, [len(t_acc_hit_ids)])
 
             maybe_warmup = f"WARMUP {i+1}/{WARMUP_ROUNDS} | " if i < WARMUP_ROUNDS else ""
 
-            print(f"{maybe_warmup}Step {i+1:10} of {N_BATCHES} | T Loss: {t_loss.item():20.10} | T acc: {t_acc_hit_cnt:6} of {t_acc_cnt:6} ({t_acc:20.10}) | T unique acc hits: {len(t_acc_hit_ids):4} {t_acc_hit_ids} {t_hits_decoded}")
+            print(f"{maybe_warmup}Step {i+1:10} of {N_BATCHES} | T Loss: {t_loss:20.10} | T acc: {t_acc_hit_cnt:6} of {t_acc_cnt:6} ({t_acc:20.10}) | T unique acc hits: {len(t_acc_hit_ids):4} {t_acc_hit_ids} {t_hits_decoded}")
 
             lr_sched.step()
 
             if i % V_INTERVAL == 0:
-            
+
                 v_loss, v_acc_hit_cnt, v_acc_cnt, v_acc_hit_ids = eval_step(model, v_data_batch)
 
                 v_acc = v_acc_hit_cnt / v_acc_cnt
@@ -457,7 +468,7 @@ if __name__ == "__main__":
                 v_acc_hit_ids = set(map(int, v_acc_hit_ids.numpy()))
                 v_acc_hit_ids.remove(-1)
 
-                v_acc_hit_ids = sorted(list(t_acc_hit_ids))
+                v_acc_hit_ids = sorted(list(v_acc_hit_ids))
 
                 v_hits_decoded = tok.decode(v_acc_hit_ids)
 

@@ -3,7 +3,7 @@ from tinygrad.nn import Linear
 from tinygrad.nn.optim import AdamW
 from tinygrad.nn.state import get_parameters
 
-BATCH_SIZE = 100
+BATCH_SIZE = 10_000
 
 MINIBATCH_SIZE = 10_000
 N_CLASSES = 10
@@ -18,7 +18,7 @@ class Model:
         self.l4 = Linear(4 * N_CLASSES, N_CLASSES)
 
 
-    def __call__(self, x: Tensor):
+    def __call__(self, x: Tensor) -> Tensor:
         x_l1 = self.l1(x)
         x_l2 = self.l2(x_l1)
         x_l3 = self.l3(x_l2)
@@ -32,28 +32,36 @@ def gen_train_data():
 
     return x, y
 
-@TinyJit
 def epoch_step(model, opt, ctx):
-        with ctx:
-            opt.zero_grad()
+    @TinyJit
+    def mb_step(model):
+        x, y_gt = gen_train_data()
 
-            loss_mean = Tensor(0.0, requires_grad=False)
-            acc_mean = Tensor(0.0, requires_grad=False)
+        y_hat = model(x)
 
-            for j in range(BATCH_SIZE):
-                x, y_gt = gen_train_data()
+        loss = y_hat.sparse_categorical_crossentropy(y_gt).backward()
+        acc = (y_hat.argmax(-1) == y_gt).mean()
+        acc.requires_grad = False
 
-                y_hat = model(x)
+        return loss, acc
 
-                loss = y_hat.sparse_categorical_crossentropy(y_gt).backward()
-                acc = (y_hat.argmax(-1) == y_gt).mean()
+    with ctx:
+        opt.zero_grad()
 
-                loss_mean = loss_mean + (loss / BATCH_SIZE)
-                acc_mean = acc_mean + (acc / BATCH_SIZE)
+        loss_mean = 0.0
+        acc_mean = 0.0
 
-            opt.step()
+        for j in range(BATCH_SIZE):
+            loss, acc = mb_step(model)
 
-            return loss_mean, acc_mean
+            loss_mean += loss.item() / BATCH_SIZE
+            acc_mean += acc.item() / BATCH_SIZE
+
+
+
+        opt.step()
+
+        return loss_mean, acc_mean
 
 def main():
     model = Model()
@@ -68,13 +76,13 @@ def main():
 
         loss_mean, acc_mean = epoch_step(model, opt, ctx)
 
-        print(f"Loss: {loss_mean.item():10.5} Acc: {acc_mean.item():10.5}")
+        print(f"Loss: {loss_mean:10.5} Acc: {acc_mean:10.5}")
 
         first_iter = False
 
-    
-    
-    
+
+
+
 
 if __name__ == "__main__":
     main()
