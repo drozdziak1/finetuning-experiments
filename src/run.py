@@ -1,8 +1,9 @@
-from tinygrad.tensor import Tensor
-from tinygrad.nn.optim import AdamW, Optimizer
-from tinygrad.engine.jit import TinyJit
 from tinygrad import Context, Device, dtypes, nn
+from tinygrad.engine.jit import TinyJit
+from tinygrad.helpers import trange
 from tinygrad.nn import LayerNorm, Linear, Embedding
+from tinygrad.nn.optim import AdamW, Optimizer
+from tinygrad.tensor import Tensor
 
 from os import getenv
 from tokenizers import Tokenizer
@@ -25,26 +26,32 @@ import time
 
 FINEWEB_PATH = "/home/drozdziak1/Documents/datasets/fineweb/000_00000.parquet"
 
-N_BATCHES = 16384 * 16384
+N_BATCHES = 600_000
 
 V_INTERVAL = 50
 
 GPUS = tuple(f"{Device.DEFAULT}:{i}" for i in range(int(getenv("GPUS", 2))))
 
-BATCH_SIZE = 4
+# Whether to use just the first parquet file or the whole dataset (the whole dataset takes ~30s to load)
+DS_QUICK = bool(getenv("DS_QUICK", False))
 
-MINIBATCH_SIZE = 1024
+# Whether to draw the charts window
+CHART = bool(getenv("CHART", False))
 
-CTX_SIZE = 64
-NUM_BLOCKS = 4
-EMBED_DIM = 96
-NUM_HEADS = 4
+BATCH_SIZE = 32
+
+MINIBATCH_SIZE = 16
+
+CTX_SIZE = 1024
+NUM_BLOCKS = 12
+EMBED_DIM = 768
+NUM_HEADS = 12
 FF_DIM = 4 * EMBED_DIM // 3
 DROPOUT = 0
 
-LR = 1.5e-4
-WARMUP_LR = 0
-WARMUP_ROUNDS = 200
+LR = 6e-4
+WARMUP_LR = 6e-5
+WARMUP_ROUNDS = 2_000
 
 EPSILON = 1e-5
 
@@ -104,7 +111,7 @@ class ChartData:
         self.v_loss = np.array([])
         self.v_acc = np.array([])
         self.v_acc_unique_hits = np.array([])
-
+        
         self.ax_loss.set_title("Loss")
         self.ax_loss.set_xlabel("training batch")
         self.ax_loss.set_ylabel("cat x-entropy loss")
@@ -179,10 +186,10 @@ class Transformer:
         self.embed_dim = embed_dim
         self.ff_dim = ff_dim
         self.ctx_size = ctx_size
-        self.vocab_size = vocab_size
+        self.vocab_size = vocab_size + (64 - vocab_size % 64) # Round up to nearest multiple of 64
         self.dropout = dropout
 
-        self.embed = Embedding(vocab_size, embed_dim)
+        self.embed = Embedding(self.vocab_size, embed_dim)
 
         self.pe = Embedding(ctx_size, embed_dim)
 
@@ -193,7 +200,7 @@ class Transformer:
 
         self.ln = LayerNorm(embed_dim, eps=EPSILON)
 
-        self.unembed = Tensor.kaiming_normal(embed_dim, vocab_size)
+        self.unembed = Tensor.kaiming_normal(embed_dim, self.vocab_size)
 
     def __call__(self, x: Tensor):
         """
@@ -274,8 +281,10 @@ def load_tokenizer(model_name="gpt2"):
     return Tokenizer.from_pretrained(model_name)
 
 def load_dataset():
-    ds = datasets.load_dataset("HuggingFaceFW/fineweb", "sample-100BT", split="train")
-    # ds = datasets.load_dataset("HuggingFaceFW/fineweb", data_files="sample/100BT/000_00000.parquet", split="train", )
+    if DS_QUICK:
+        ds = datasets.load_dataset("HuggingFaceFW/fineweb", data_files="sample/100BT/000_00000.parquet", split="train", )
+    else:
+        ds = datasets.load_dataset("HuggingFaceFW/fineweb", "sample-100BT", split="train")
 
     ds_iter = ds.to_iterable_dataset().shuffle(buffer_size=10_000, seed=RNG_SEED).iter(1)
 
@@ -316,7 +325,7 @@ def train_step(model: Transformer, batch: Tensor, opt: Optimizer):
         acc_scores = y_hat.argmax(-1) == y_gt
         acc_scores.requires_grad = False
 
-        acc_hits_by_id = acc_scores.where(y_gt, model.vocab_size).one_hot(model.vocab_size + 1).sum(axis=(0, 1), dtype=dtypes.int32)
+        acc_hits_by_id = acc_scores.where(y_gt, model.vocab_size + 1).reshape(-1)
         acc_hits_by_id.requires_grad = False
 
         return loss, acc_scores, acc_hits_by_id
@@ -324,34 +333,38 @@ def train_step(model: Transformer, batch: Tensor, opt: Optimizer):
     total_loss = Tensor(0.0, requires_grad=False).to_(GPUS)
     total_acc_hit_cnt = Tensor(0, requires_grad=False, dtype=dtypes.int32).to_(GPUS)
 
-    total_acc_hits_by_id = Tensor.zeros(model.vocab_size + 1, requires_grad=False, dtype=dtypes.int32).shard_(GPUS, axis=0)
+    total_acc_hits_by_id = set()
 
     # For assigning token ID value during set construction
-    arange_helper = Tensor.arange(0, model.vocab_size + 1, requires_grad=False).shard_(GPUS, axis=0)
+    arange_helper = Tensor.arange(0, model.vocab_size + 2, requires_grad=False).shard_(GPUS, axis=0)
 
     acc_cnt = BATCH_SIZE * MINIBATCH_SIZE * CTX_SIZE
 
     opt.zero_grad()
 
-    for idx, minibatch in enumerate(batch):
+    mb_iter_start = time.perf_counter()
+    for i in trange(BATCH_SIZE):
+
+        minibatch = batch[i]
 
         x = minibatch[:, :-1].shard_(GPUS, axis=0)
         y_gt = minibatch[:, 1:].shard_(GPUS, axis=0)
 
         loss, acc_scores, acc_hits_by_id = mb_step(model, x, y_gt)
 
-        total_loss = total_loss + loss
+        total_loss = total_loss + loss.realize()
+        total_acc_hit_cnt = total_acc_hit_cnt + acc_scores.sum(dtype=dtypes.int32).realize()
+        total_acc_hits_by_id = total_acc_hits_by_id.union(acc_hits_by_id.tolist())
 
-        total_acc_hit_cnt = total_acc_hit_cnt + acc_scores.sum(dtype=dtypes.int32)
-        total_acc_hits_by_id = total_acc_hits_by_id + acc_hits_by_id
+    mb_iter_end = time.perf_counter()
+    print(f"fwd took {mb_iter_end - mb_iter_start:.5}s")
 
-
+    opt_step_start = time.perf_counter()
     opt.step()
+    opt_step_end = time.perf_counter()
+    print(f"bwd took {opt_step_end - opt_step_start:.5}s")
 
-
-    total_acc_hits_by_id = (total_acc_hits_by_id > 0).where(arange_helper, model.vocab_size)
-    total_acc_hits_by_id = set(total_acc_hits_by_id.tolist())
-    total_acc_hits_by_id.remove(model.vocab_size)
+    total_acc_hits_by_id.remove(model.vocab_size + 1)
 
     return total_loss.item(), total_acc_hit_cnt.item(), acc_cnt, total_acc_hits_by_id
 
@@ -402,7 +415,7 @@ def gen_step(model: Transformer, tokenizer: Tokenizer):
 
     return tokenizer.decode(tokens)
 
-if __name__ == "__main__":
+def main():
     tok = load_tokenizer()
 
     ds_it = load_dataset()
@@ -422,7 +435,7 @@ if __name__ == "__main__":
 
     print(f"Training a {param_count} parameter model")
 
-    opt = AdamW(params=params, lr=WARMUP_LR)
+    opt = AdamW(params=params, lr=WARMUP_LR, b2=0.95, weight_decay=1e-1)
     lr_sched = LRSchedWithWarmup(WARMUP_ROUNDS, LR, opt, CosineAnnealingLR, opt, 100000)
 
     # I'm a bit tired of setting DEBUG=2 manually when playing with the  metaparameters
@@ -430,10 +443,12 @@ if __name__ == "__main__":
 
     ani = animation.FuncAnimation(CHART_DATA.fig, CHART_DATA.plot, interval=1000, blit=False)
 
-    plt.show(block=False)
+    if CHART:
+        plt.show(block=False)
 
     for i in range(N_BATCHES):
-        plt.pause(0.05)
+        if CHART:
+            plt.pause(0.05)
 
         if QUITTING:
             break
@@ -447,13 +462,23 @@ if __name__ == "__main__":
         with ctx:
 
             try:
-                batch = Tensor([next(minibatch_it) for _ in range(BATCH_SIZE)])
+                iter_start = time.perf_counter()
+                batch_list = [next(minibatch_it) for _ in range(BATCH_SIZE)]
+                iter_end = time.perf_counter()
+                print(f"batch load took {iter_end - iter_start:.5}s")
+
+                batch = Tensor(batch_list)
+
             except Exception as e:
                 print(f"Ran out of batches for training! Cleaning up...")
                 save_plot()
                 sys.exit(1)
 
+            t_start = time.perf_counter()
             t_loss, t_acc_hit_cnt, t_acc_cnt, t_acc_hit_ids = train_step(model, batch, opt)
+            t_end = time.perf_counter()
+
+            print(f"train_step() took {t_end - t_start:.5}s")
 
             t_acc_hit_cnt = t_acc_hit_cnt
 
@@ -501,4 +526,7 @@ if __name__ == "__main__":
 
         first_pass = False
 
-save_plot()
+    save_plot()
+
+if __name__ == "__main__":
+    main()
