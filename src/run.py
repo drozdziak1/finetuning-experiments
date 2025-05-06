@@ -38,9 +38,9 @@ DS_QUICK = bool(getenv("DS_QUICK", False))
 # Whether to draw the charts window
 CHART = bool(getenv("CHART", False))
 
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 
-MINIBATCH_SIZE = 16
+MINIBATCH_SIZE = 8
 
 CTX_SIZE = 1024
 NUM_BLOCKS = 12
@@ -258,7 +258,7 @@ class TBlock:
 
         x_ln_attn = self.ln_attn(x)
 
-        x_q, x_k, x_v = [x_ln_attn.dot(t).reshape(x_ln_attn.shape[0], x_ln_attn.shape[1], self.num_heads, self.head_size) for t in [self.q_w, self.k_w, self.v_w]]
+        x_q, x_k, x_v = [x_ln_attn.dot(t).reshape(x_ln_attn.shape[0], x_ln_attn.shape[1], self.num_heads, self.head_size).transpose(1, 2) for t in [self.q_w, self.k_w, self.v_w]]
 
         x_atn = Tensor.scaled_dot_product_attention(x_q, x_k, x_v, is_causal=True)
 
