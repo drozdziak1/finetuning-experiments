@@ -24,11 +24,10 @@ import threading
 import time
 
 
-FINEWEB_PATH = "/home/drozdziak1/Documents/datasets/fineweb/000_00000.parquet"
-
 N_BATCHES = 600_000
 
 V_INTERVAL = 50
+GEN_INTERVAL = 50
 
 GPUS = tuple(f"{Device.DEFAULT}:{i}" for i in range(int(getenv("GPUS", 2))))
 
@@ -46,14 +45,14 @@ CTX_SIZE = 1024
 NUM_BLOCKS = 12
 EMBED_DIM = 768
 NUM_HEADS = 12
-FF_DIM = 4 * EMBED_DIM // 3
+FF_DIM = 4 * EMBED_DIM
 DROPOUT = 0
 
 LR = 6e-4
 WARMUP_LR = 6e-5
-WARMUP_ROUNDS = 2_000
+WARMUP_ROUNDS = 2000
 
-EPSILON = 1e-5
+EPSILON = 1e-7
 
 TOPK_K = 16
 
@@ -69,7 +68,7 @@ NP_RNG = np.random.default_rng(seed=RNG_SEED)
 
 class LRSchedWithWarmup:
     """
-    Shoves a bunch of warmup steps before the specisied Scheduler begins its first step
+    Shoves a bunch of warmup steps before the specified Scheduler begins its first step
     """
 
     def __init__(self, warmup_rounds: int, next_lr: float, opt: Optimizer, next_scheduler_ctor, *args, **kwargs):
@@ -193,8 +192,6 @@ class Transformer:
 
         self.pe = Embedding(ctx_size, embed_dim)
 
-        self.allpos = Tensor.arange(0, CTX_SIZE).unsqueeze(0)
-        self.allpos.requires_grad = False
 
         self.blocks = [TBlock(embed_dim, num_heads, ff_dim, dropout) for _ in range(num_blocks)]
 
@@ -211,7 +208,9 @@ class Transformer:
 
         batch_size, seq_len = x.shape
 
-        x_pe = x_embedded + self.pe(self.allpos)
+        allpos = Tensor.arange(0, CTX_SIZE).unsqueeze(0).to_(GPUS)
+        allpos.requires_grad = False
+        x_pe = x_embedded + self.pe(allpos)
 
         x_refined = x_pe.sequential(self.blocks)
 
@@ -239,9 +238,7 @@ class TBlock:
 
         self.ln_attn = LayerNorm(embed_dim, eps=EPSILON)
 
-        self.q_w = Tensor.kaiming_normal(embed_dim, embed_dim)
-        self.k_w = Tensor.kaiming_normal(embed_dim, embed_dim)
-        self.v_w = Tensor.kaiming_normal(embed_dim, embed_dim)
+        self.w_qkv = Linear(embed_dim, 3 * embed_dim, bias=True)
 
         self.atn_out_w = Tensor.kaiming_normal(embed_dim, embed_dim)
 
@@ -258,11 +255,15 @@ class TBlock:
 
         x_ln_attn = self.ln_attn(x)
 
-        x_q, x_k, x_v = [x_ln_attn.dot(t).reshape(x_ln_attn.shape[0], x_ln_attn.shape[1], self.num_heads, self.head_size).transpose(1, 2) for t in [self.q_w, self.k_w, self.v_w]]
+        x_qkv = self.w_qkv(x_ln_attn)
+
+        x_q, x_k, x_v = [x_qkv.shrink((None, None, (i*self.embed_dim, (i+1) * self.embed_dim))).reshape(None, None, self.num_heads, self.head_size).transpose(1, 2) for i in range(3)]
+
+        # x_q, x_k, x_v = [x_ln_attn.matmul(t).reshape(x_ln_attn.shape[0], x_ln_attn.shape[1], self.num_heads, self.head_size).transpose(1, 2) for t in [self.q_w, self.k_w, self.v_w]]
 
         x_atn = Tensor.scaled_dot_product_attention(x_q, x_k, x_v, is_causal=True)
 
-        x_atn_out = x_atn.reshape(x.shape).dot(self.atn_out_w)
+        x_atn_out = x_atn.transpose(1, 2).reshape(x.shape).matmul(self.atn_out_w)
 
         x = x + x_atn_out.dropout(self.dropout)
 
@@ -290,14 +291,14 @@ def load_dataset():
 
     return ds_iter
 
-def dataset_minibatch_iter(ds_iter, tokenizer, batch_size, ctx_size=CTX_SIZE):
+def dataset_minibatch_iter(ds_iter, tokenizer, minibatch_size, ctx_size=CTX_SIZE):
     """
     each iteration yields a training batch
     """
+    bufs = [tokenizer.encode(next(ds_iter)["text"][0]).ids for _ in range(minibatch_size)]
     while True:
         batch = []
 
-        bufs = [tokenizer.encode(next(ds_iter)["text"][0]).ids for _ in range(batch_size)]
         for buf in bufs:
             while len(buf) < ctx_size + 1:
                 buf += tokenizer.encode("<|endoftext|>").ids
@@ -310,8 +311,7 @@ def dataset_minibatch_iter(ds_iter, tokenizer, batch_size, ctx_size=CTX_SIZE):
 
         yield batch
 
-@Tensor.train()
-def train_step(model: Transformer, batch: Tensor, opt: Optimizer):
+def t_v_step(model: Transformer, batch: Tensor, opt: Optimizer, train: bool):
     @TinyJit
     def mb_step(model, x, y_gt):
         y_hat = model(x)
@@ -328,7 +328,10 @@ def train_step(model: Transformer, batch: Tensor, opt: Optimizer):
         acc_hits_by_id = acc_scores.where(y_gt, model.vocab_size + 1).reshape(-1)
         acc_hits_by_id.requires_grad = False
 
-        return loss, acc_scores, acc_hits_by_id
+        return loss, acc_scores.sum(dtype=dtypes.int32), acc_hits_by_id
+
+    if train:
+        Tensor.training = True
 
     total_loss = Tensor(0.0, requires_grad=False).to_(GPUS)
     total_acc_hit_cnt = Tensor(0, requires_grad=False, dtype=dtypes.int32).to_(GPUS)
@@ -340,7 +343,8 @@ def train_step(model: Transformer, batch: Tensor, opt: Optimizer):
 
     acc_cnt = BATCH_SIZE * MINIBATCH_SIZE * CTX_SIZE
 
-    opt.zero_grad()
+    if train:
+        opt.zero_grad()
 
     mb_iter_start = time.perf_counter()
     for i in trange(BATCH_SIZE):
@@ -350,50 +354,38 @@ def train_step(model: Transformer, batch: Tensor, opt: Optimizer):
         x = minibatch[:, :-1].shard_(GPUS, axis=0)
         y_gt = minibatch[:, 1:].shard_(GPUS, axis=0)
 
-        loss, acc_scores, acc_hits_by_id = mb_step(model, x, y_gt)
+        loss, acc_hit_cnt, acc_hits_by_id = mb_step(model, x, y_gt)
 
-        total_loss = total_loss + loss.realize()
-        total_acc_hit_cnt = total_acc_hit_cnt + acc_scores.sum(dtype=dtypes.int32).realize()
+        total_loss = total_loss + loss
+        total_acc_hit_cnt = total_acc_hit_cnt + acc_hit_cnt
         total_acc_hits_by_id = total_acc_hits_by_id.union(acc_hits_by_id.tolist())
 
     mb_iter_end = time.perf_counter()
     print(f"fwd took {mb_iter_end - mb_iter_start:.5}s")
 
-    opt_step_start = time.perf_counter()
-    opt.step()
-    opt_step_end = time.perf_counter()
-    print(f"bwd took {opt_step_end - opt_step_start:.5}s")
+    if train:
+        opt_step_start = time.perf_counter()
+        opt.step()
+        opt_step_end = time.perf_counter()
+        print(f"bwd took {opt_step_end - opt_step_start:.5}s")
+
+    Tensor.training = False
 
     total_acc_hits_by_id.remove(model.vocab_size + 1)
 
     return total_loss.item(), total_acc_hit_cnt.item(), acc_cnt, total_acc_hits_by_id
 
-# @TinyJit
-def eval_step(model, batch):
-    x = batch[:, :-1].shard_(GPUS, axis=0)
-    y_gt = batch[:, 1:].shard_(GPUS, axis=0)
-
-    y_hat = model(x)
-
-    losses = y_hat.sparse_categorical_crossentropy(y_gt, reduction = "none")
-
-    loss = losses.mean()
-
-    acc_scores = y_hat.argmax(-1) == y_gt
-    acc_scores.requires_grad = False
-
-    acc_cnt = len(acc_scores.reshape(-1))
-
-    acc_hit_cnt = acc_scores.sum()
-    acc_hit_cnt.requires_grad = False
-
-    acc_hit_ids = acc_scores.where(y_gt, -1).reshape(-1)
-    acc_hit_ids.requires_grad = False
-
-    return loss, acc_hit_cnt, acc_cnt, acc_hit_ids.reshape(-1)
-
-# @TinyJit
 def gen_step(model: Transformer, tokenizer: Tokenizer):
+    @TinyJit
+    def gen_token_step(model, tokens: Tensor) -> Tensor:
+        ys = model(tokens)
+
+        last_y = ys[0, len(tokens) - 1]
+
+        _topk_values, topk_indices = last_y.topk(TOPK_K, dim=-1)
+
+        return topk_indices
+
     x = tokenizer.encode("<|endoftext|>").ids * CTX_SIZE
 
     tokens = tokenizer.encode("What in").ids
@@ -403,13 +395,9 @@ def gen_step(model: Transformer, tokenizer: Tokenizer):
         for j in range(len(tokens)):
             x[j] = tokens[j]
 
-        ys = model(Tensor(x, requires_grad=False).unsqueeze(0).shard_(GPUS, axis=1)).numpy()
+        topk_indices = gen_token_step(model, Tensor(x, requires_grad=False).unsqueeze(0).to_(GPUS))
 
-        last_y = ys[0, len(tokens) - 1]
-
-        topk = last_y.argpartition(-TOPK_K)[-TOPK_K:]
-
-        tok_id = NP_RNG.choice(topk)
+        tok_id = NP_RNG.choice(topk_indices.reshape(-1).numpy())
 
         tokens += [tok_id]
 
@@ -422,7 +410,7 @@ def main():
 
     minibatch_it = dataset_minibatch_iter(ds_it, tok, MINIBATCH_SIZE)
 
-    v_data_batch = Tensor(next(minibatch_it), requires_grad=False)
+    v_batch = Tensor([next(minibatch_it) for i in range(BATCH_SIZE)], requires_grad=False)
 
     model = Transformer(CTX_SIZE, NUM_BLOCKS, EMBED_DIM, NUM_HEADS, FF_DIM, tok.get_vocab_size(), DROPOUT)
 
@@ -475,7 +463,7 @@ def main():
                 sys.exit(1)
 
             t_start = time.perf_counter()
-            t_loss, t_acc_hit_cnt, t_acc_cnt, t_acc_hit_ids = train_step(model, batch, opt)
+            t_loss, t_acc_hit_cnt, t_acc_cnt, t_acc_hit_ids = t_v_step(model, batch, opt, True)
             t_end = time.perf_counter()
 
             print(f"train_step() took {t_end - t_start:.5}s")
@@ -500,24 +488,29 @@ def main():
 
             if i % V_INTERVAL == 0:
 
-                v_loss, v_acc_hit_cnt, v_acc_cnt, v_acc_hit_ids = eval_step(model, v_data_batch)
+                v_start = time.perf_counter()
+                v_loss, v_acc_hit_cnt, v_acc_cnt, v_acc_hit_ids = t_v_step(model, v_batch, opt, False)
+                v_end = time.perf_counter()
+
+                print(f"train_step() took {v_end - v_start:.5}s")
+
+                v_acc_hit_cnt = v_acc_hit_cnt
 
                 v_acc = v_acc_hit_cnt / v_acc_cnt
-
-                v_acc_hit_ids = set(map(int, v_acc_hit_ids.numpy()))
-                v_acc_hit_ids.remove(-1)
 
                 v_acc_hit_ids = sorted(list(v_acc_hit_ids))
 
                 v_hits_decoded = tok.decode(v_acc_hit_ids)
 
-                CHART_DATA.v_loss = np.append(CHART_DATA.v_loss, [v_loss.item()])
-                CHART_DATA.v_acc = np.append(CHART_DATA.v_acc, [v_acc.item()])
+                CHART_DATA.v_loss = np.append(CHART_DATA.v_loss, [v_loss])
+                CHART_DATA.v_acc = np.append(CHART_DATA.v_acc, [v_acc])
                 CHART_DATA.v_acc_unique_hits = np.append(CHART_DATA.v_acc_unique_hits, [len(v_acc_hit_ids)])
 
-                print(f"Step {i+1:10} of {N_BATCHES} | V Loss: {v_loss.item():20.10} | V acc: {v_acc_hit_cnt.item():6} of {v_acc_cnt:6} ({v_acc.item():20.10}) | V unique acc hits: {len(v_acc_hit_ids):4} {v_acc_hit_ids} {v_hits_decoded}")
+                maybe_warmup = f"WARMUP {i+1}/{WARMUP_ROUNDS} | " if i < WARMUP_ROUNDS else ""
 
-            if i % 500 == 0:
+                print(f"{maybe_warmup}Step {i+1:10} of {N_BATCHES} | V Loss: {v_loss:20.10} | V acc: {v_acc_hit_cnt:6} of {v_acc_cnt:6} ({v_acc:20.10}) | V unique acc hits: {len(v_acc_hit_ids):4} {v_acc_hit_ids} {v_hits_decoded}")
+
+            if i % GEN_INTERVAL == 0:
                 gen_str = gen_step(model, tok)
 
                 print(f"Gen: {gen_str}")
