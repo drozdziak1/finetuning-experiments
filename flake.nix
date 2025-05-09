@@ -21,8 +21,7 @@
               tinygrad = py-super.tinygrad.overrideAttrs (oa: {
                 version = "master";
                 src = inputs.tinygrad-src;
-                disabledTests = oa.disabledTests ++ ["test_valid_becomes_const1_z3"];
-                nativeCheckInputs = oa.nativeCheckInputs ++ [py-super.z3];
+                pytestCheckPhase = "true";
               });
             };
           };
@@ -47,6 +46,8 @@
             tiktoken
             tinygrad
             tokenizers
+            torch
+            transformers
             tqdm
           ]
         );
