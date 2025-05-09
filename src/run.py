@@ -37,9 +37,13 @@ DS_QUICK = bool(getenv("DS_QUICK", False))
 # Whether to draw the charts window
 CHART = bool(getenv("CHART", False))
 
-BATCH_SIZE = 64
+CHART_EXCERPT_DIM = 24
 
-MINIBATCH_SIZE = 8
+CHART_EXCERPT_TOPK = 8
+
+BATCH_SIZE = 128
+
+MINIBATCH_SIZE = 4
 
 CTX_SIZE = 1024
 NUM_BLOCKS = 12
@@ -54,7 +58,7 @@ WARMUP_ROUNDS = 2000
 
 EPSILON = 1e-7
 
-TOPK_K = 16
+TOPK_K = 1
 
 N_GEN_TOKENS = 8
 
@@ -64,6 +68,9 @@ random.seed(RNG_SEED)
 Tensor.manual_seed(RNG_SEED)
 
 NP_RNG = np.random.default_rng(seed=RNG_SEED)
+
+# determined at runtime from vocab_size + 1
+ACC_MISS_ID = None
 
 
 class LRSchedWithWarmup:
@@ -102,7 +109,7 @@ class LRSchedWithWarmup:
 
 class ChartData:
     def __init__(self):
-        self.fig, (self.ax_loss, self.ax_acc, self.ax_acc_unique_hits) = plt.subplots(3)
+        self.fig, (self.ax_loss, self.ax_acc, self.ax_acc_unique_hits, self.ax_layer_preview) = plt.subplots(4, 1, height_ratios=[1, 1, 1, 3])
 
         self.t_loss = np.array([])
         self.t_acc = np.array([])
@@ -110,7 +117,9 @@ class ChartData:
         self.v_loss = np.array([])
         self.v_acc = np.array([])
         self.v_acc_unique_hits = np.array([])
-        
+        self.layer_preview = np.eye(CHART_EXCERPT_TOPK, CHART_EXCERPT_DIM)
+        self.layer_preview_labels = list(range(CHART_EXCERPT_TOPK))
+
         self.ax_loss.set_title("Loss")
         self.ax_loss.set_xlabel("training batch")
         self.ax_loss.set_ylabel("cat x-entropy loss")
@@ -123,9 +132,26 @@ class ChartData:
         self.ax_acc_unique_hits.set_xlabel("training batch")
         self.ax_acc_unique_hits.set_ylabel("n unique correct tokens")
 
+        self.ax_layer_preview.set_title("Excerpt from embed layer")
+
+        chart_excerpt_range = EMBED_DIM // CHART_EXCERPT_DIM
+        chart_excerpt_dim_ranges = [f"{i*chart_excerpt_range}..{(i+1)*chart_excerpt_range}" for i in range(CHART_EXCERPT_DIM)]
+
+        self.ax_layer_preview.set_xticks(range(CHART_EXCERPT_DIM), labels=chart_excerpt_dim_ranges, rotation=45, ha="right", rotation_mode="anchor")
+
         self.ln_t_loss, self.ln_v_loss = self.ax_loss.plot([], self.t_loss, 'b-', [], [], 'r--')
         self.ln_t_acc, self.ln_v_acc = self.ax_acc.plot([], [], 'b-', [], [], 'r--')
         self.ln_t_acc_unique_hits, self.ln_v_acc_unique_hits = self.ax_acc_unique_hits.plot([], [], 'b-', [], [], 'r--')
+
+        self.im_layer_preview = self.ax_layer_preview.imshow(self.layer_preview)
+
+        self.layer_preview_text = [[None] * len(self.layer_preview[0]) for _ in range(len(self.layer_preview))]
+
+        for i in range(len(self.layer_preview)):
+            for j in range(len(self.layer_preview[i])):
+                self.layer_preview_text[i][j] = self.ax_layer_preview.text(j, i, f"{self.layer_preview[i, j]:.2}", ha="center", va="center", color="w", fontsize="xx-small", fontstretch=1000)
+
+        # self.fig.tight_layout()
 
 
     def plot(self, _i):
@@ -141,6 +167,13 @@ class ChartData:
         self.ln_t_acc_unique_hits.set_data(t_idx, self.t_acc_unique_hits)
         self.ln_v_acc_unique_hits.set_data(v_idx, self.v_acc_unique_hits)
 
+        self.ax_layer_preview.set_yticks(range(len(self.layer_preview_labels)), labels=self.layer_preview_labels)
+        self.im_layer_preview.set_data(self.layer_preview)
+
+        for i in range(len(self.layer_preview)):
+            for j in range(len(self.layer_preview[i])):
+                self.layer_preview_text[i][j].set_text(f"{self.layer_preview[i, j]:.2}")
+
         self.ax_loss.relim()
         self.ax_loss.autoscale()
         self.ax_acc.relim()
@@ -148,6 +181,8 @@ class ChartData:
         self.ax_acc_unique_hits.relim()
         self.ax_acc_unique_hits.autoscale()
 
+        # self.im_layer_preview.relim()
+        self.im_layer_preview.autoscale()
 
 
 CHART_DATA = ChartData()
@@ -197,7 +232,9 @@ class Transformer:
 
         self.ln = LayerNorm(embed_dim, eps=EPSILON)
 
-        self.unembed = Tensor.kaiming_normal(embed_dim, self.vocab_size)
+        self.unembed = Linear(embed_dim, self.vocab_size)
+
+        self.embed.weight = self.unembed.weight
 
     def __call__(self, x: Tensor):
         """
@@ -216,14 +253,9 @@ class Transformer:
 
         x_ln = self.ln(x_refined)
 
-        x_unembed = x_ln.dot(self.unembed).softmax()
+        x_unembed = self.unembed(x_ln).softmax()
 
         return x_unembed
-
-
-
-
-
 
 class TBlock:
     def __init__(self, embed_dim, num_heads, ff_dim, dropout):
@@ -238,7 +270,7 @@ class TBlock:
 
         self.ln_attn = LayerNorm(embed_dim, eps=EPSILON)
 
-        self.w_qkv = Linear(embed_dim, 3 * embed_dim, bias=True)
+        self.w_qkv = Linear(embed_dim, 3 * embed_dim, bias=False)
 
         self.atn_out_w = Tensor.kaiming_normal(embed_dim, embed_dim)
 
@@ -259,11 +291,9 @@ class TBlock:
 
         x_q, x_k, x_v = [x_qkv.shrink((None, None, (i*self.embed_dim, (i+1) * self.embed_dim))).reshape(None, None, self.num_heads, self.head_size).transpose(1, 2) for i in range(3)]
 
-        # x_q, x_k, x_v = [x_ln_attn.matmul(t).reshape(x_ln_attn.shape[0], x_ln_attn.shape[1], self.num_heads, self.head_size).transpose(1, 2) for t in [self.q_w, self.k_w, self.v_w]]
+        x_atn = Tensor.scaled_dot_product_attention(x_q, x_k, x_v, is_causal=True, dropout_p=DROPOUT)
 
-        x_atn = Tensor.scaled_dot_product_attention(x_q, x_k, x_v, is_causal=True)
-
-        x_atn_out = x_atn.transpose(1, 2).reshape(x.shape).matmul(self.atn_out_w)
+        x_atn_out = x_atn.transpose(1, 2).reshape(x.shape).linear(self.atn_out_w)
 
         x = x + x_atn_out.dropout(self.dropout)
 
@@ -291,29 +321,34 @@ def load_dataset():
 
     return ds_iter
 
-def dataset_minibatch_iter(ds_iter, tokenizer, minibatch_size, ctx_size=CTX_SIZE):
+def dataset_batch_iter(ds_iter, tokenizer, batch_size, minibatch_size, ctx_size=CTX_SIZE):
     """
     each iteration yields a training batch
     """
-    bufs = [tokenizer.encode(next(ds_iter)["text"][0]).ids for _ in range(minibatch_size)]
+    bufs = [[[] for _ in range(minibatch_size)] for _ in range(batch_size)]
     while True:
         batch = []
+        for b_i in range(batch_size):
+            minibatch = []
+            for mb_i in range(minibatch_size):
+                while len(bufs[b_i][mb_i]) < ctx_size + 1:
+                    bufs[b_i][mb_i] += tokenizer.encode("<|endoftext|>").ids
+                    txt = next(ds_iter)["text"][0]
+                    bufs[b_i][mb_i] += tokenizer.encode(txt).ids
 
-        for buf in bufs:
-            while len(buf) < ctx_size + 1:
-                buf += tokenizer.encode("<|endoftext|>").ids
-                buf += tokenizer.encode(next(ds_iter)["text"][0]).ids
+                minibatch_item = bufs[b_i][mb_i][:ctx_size + 1]
 
-            batch_item = buf[:ctx_size + 1]
-            buf = buf[ctx_size + 1:]
+                bufs[b_i][mb_i] = bufs[b_i][mb_i][ctx_size + 1:]
 
-            batch += [batch_item]
+                minibatch += [minibatch_item]
+            batch += [minibatch]
 
         yield batch
 
 def t_v_step(model: Transformer, batch: Tensor, opt: Optimizer, train: bool):
     @TinyJit
     def mb_step(model, x, y_gt):
+
         y_hat = model(x)
 
         losses = y_hat.sparse_categorical_crossentropy(y_gt, reduction = "none")
@@ -325,10 +360,10 @@ def t_v_step(model: Transformer, batch: Tensor, opt: Optimizer, train: bool):
         acc_scores = y_hat.argmax(-1) == y_gt
         acc_scores.requires_grad = False
 
-        acc_hits_by_id = acc_scores.where(y_gt, model.vocab_size + 1).reshape(-1)
+        acc_hits_by_id = acc_scores.where(y_gt, ACC_MISS_ID).reshape(-1).one_hot(model.vocab_size + 2).sum(0)
         acc_hits_by_id.requires_grad = False
 
-        return loss, acc_scores.sum(dtype=dtypes.int32), acc_hits_by_id
+        return loss, acc_scores, acc_hits_by_id
 
     if train:
         Tensor.training = True
@@ -336,10 +371,7 @@ def t_v_step(model: Transformer, batch: Tensor, opt: Optimizer, train: bool):
     total_loss = Tensor(0.0, requires_grad=False).to_(GPUS)
     total_acc_hit_cnt = Tensor(0, requires_grad=False, dtype=dtypes.int32).to_(GPUS)
 
-    total_acc_hits_by_id = set()
-
-    # For assigning token ID value during set construction
-    arange_helper = Tensor.arange(0, model.vocab_size + 2, requires_grad=False).shard_(GPUS, axis=0)
+    total_acc_hits_by_id = Tensor.zeros(model.vocab_size + 2, requires_grad=False, dtype=dtypes.int32).shard_(GPUS)
 
     acc_cnt = BATCH_SIZE * MINIBATCH_SIZE * CTX_SIZE
 
@@ -348,17 +380,16 @@ def t_v_step(model: Transformer, batch: Tensor, opt: Optimizer, train: bool):
 
     mb_iter_start = time.perf_counter()
     for i in trange(BATCH_SIZE):
-
         minibatch = batch[i]
 
-        x = minibatch[:, :-1].shard_(GPUS, axis=0)
-        y_gt = minibatch[:, 1:].shard_(GPUS, axis=0)
+        x = minibatch[:, :-1].shard_(GPUS).contiguous()
+        y_gt = minibatch[:, 1:].shard_(GPUS).contiguous()
 
-        loss, acc_hit_cnt, acc_hits_by_id = mb_step(model, x, y_gt)
+        loss, acc_scores, acc_hits_by_id = mb_step(model, x, y_gt)
 
-        total_loss = total_loss + loss
-        total_acc_hit_cnt = total_acc_hit_cnt + acc_hit_cnt
-        total_acc_hits_by_id = total_acc_hits_by_id.union(acc_hits_by_id.tolist())
+        total_loss = total_loss + loss.realize()
+        total_acc_hit_cnt = total_acc_hit_cnt + acc_scores.sum().realize()
+        total_acc_hits_by_id = total_acc_hits_by_id + acc_hits_by_id.realize()
 
     mb_iter_end = time.perf_counter()
     print(f"fwd took {mb_iter_end - mb_iter_start:.5}s")
@@ -371,9 +402,12 @@ def t_v_step(model: Transformer, batch: Tensor, opt: Optimizer, train: bool):
 
     Tensor.training = False
 
-    total_acc_hits_by_id.remove(model.vocab_size + 1)
+    arange_helper = Tensor.arange(model.vocab_size + 2).shard_(GPUS)
+    total_acc_hit_id_set = set((total_acc_hits_by_id > 0).where(arange_helper, ACC_MISS_ID).tolist())
 
-    return total_loss.item(), total_acc_hit_cnt.item(), acc_cnt, total_acc_hits_by_id
+    total_acc_hit_id_set.remove(ACC_MISS_ID)
+
+    return total_loss.item(), total_acc_hit_cnt.item(), acc_cnt, total_acc_hit_id_set, total_acc_hits_by_id
 
 def gen_step(model: Transformer, tokenizer: Tokenizer):
     @TinyJit
@@ -388,7 +422,7 @@ def gen_step(model: Transformer, tokenizer: Tokenizer):
 
     x = tokenizer.encode("<|endoftext|>").ids * CTX_SIZE
 
-    tokens = tokenizer.encode("What in").ids
+    tokens = tokenizer.encode("My name is").ids
 
     for i in range(N_GEN_TOKENS):
 
@@ -403,16 +437,41 @@ def gen_step(model: Transformer, tokenizer: Tokenizer):
 
     return tokenizer.decode(tokens)
 
+def prepare_excerpt_tokens(w_embed, t_acc_hits_by_id, tok):
+    topk_values, topk_indices = t_acc_hits_by_id[:-1].topk(CHART_EXCERPT_TOPK)
+
+    downsampled = w_embed[topk_indices].reshape(None, CHART_EXCERPT_DIM, -1).mean(-1).numpy()
+
+    topk_values_np = topk_values.numpy()
+
+    labels = [f"{tok.decode([token])}:{topk_values_np[i]}" for i, token in enumerate(topk_indices.numpy())]
+
+    n_found = topk_indices.shape[0]
+    n_missing = CHART_EXCERPT_TOPK - n_found 
+
+    if n_missing >= 0:
+        downsampled = np.pad(downsampled, [(0, n_missing), (0, 0)], mode="constant")
+        labels = labels + ["<none>"] * n_missing
+    else:
+        downsampled = downsampled[:CHART_EXCERPT_TOPK]
+        labels = labels[:CHART_EXCERPT_TOPK]
+
+    return downsampled, labels
+
 def main():
     tok = load_tokenizer()
 
+
     ds_it = load_dataset()
 
-    minibatch_it = dataset_minibatch_iter(ds_it, tok, MINIBATCH_SIZE)
+    batch_it = dataset_batch_iter(ds_it, tok, BATCH_SIZE, MINIBATCH_SIZE)
 
-    v_batch = Tensor([next(minibatch_it) for i in range(BATCH_SIZE)], requires_grad=False)
+    v_batch = Tensor(next(batch_it), requires_grad=False)
 
     model = Transformer(CTX_SIZE, NUM_BLOCKS, EMBED_DIM, NUM_HEADS, FF_DIM, tok.get_vocab_size(), DROPOUT)
+
+    global ACC_MISS_ID
+    ACC_MISS_ID = model.vocab_size + 1
 
     # Sharding
     for _k, x in nn.state.get_state_dict(model).items(): x.to_(GPUS)
@@ -423,7 +482,7 @@ def main():
 
     print(f"Training a {param_count} parameter model")
 
-    opt = AdamW(params=params, lr=WARMUP_LR, b2=0.95, weight_decay=1e-1)
+    opt = AdamW(params=params, lr=WARMUP_LR, b2=0.95, weight_decay=0.1)
     lr_sched = LRSchedWithWarmup(WARMUP_ROUNDS, LR, opt, CosineAnnealingLR, opt, 100000)
 
     # I'm a bit tired of setting DEBUG=2 manually when playing with the  metaparameters
@@ -436,7 +495,7 @@ def main():
 
     for i in range(N_BATCHES):
         if CHART:
-            plt.pause(0.05)
+            plt.pause(1)
 
         if QUITTING:
             break
@@ -451,7 +510,7 @@ def main():
 
             try:
                 iter_start = time.perf_counter()
-                batch_list = [next(minibatch_it) for _ in range(BATCH_SIZE)]
+                batch_list = next(batch_it)
                 iter_end = time.perf_counter()
                 print(f"batch load took {iter_end - iter_start:.5}s")
 
@@ -463,7 +522,7 @@ def main():
                 sys.exit(1)
 
             t_start = time.perf_counter()
-            t_loss, t_acc_hit_cnt, t_acc_cnt, t_acc_hit_ids = t_v_step(model, batch, opt, True)
+            t_loss, t_acc_hit_cnt, t_acc_cnt, t_acc_hit_id_set, t_acc_hits_by_id = t_v_step(model, batch, opt, True)
             t_end = time.perf_counter()
 
             print(f"train_step() took {t_end - t_start:.5}s")
@@ -472,13 +531,14 @@ def main():
 
             t_acc = t_acc_hit_cnt / t_acc_cnt
 
-            t_acc_hit_ids = sorted(list(t_acc_hit_ids))
+            t_acc_hit_ids = sorted(list(t_acc_hit_id_set))
 
             t_hits_decoded = tok.decode(t_acc_hit_ids)
 
             CHART_DATA.t_loss = np.append(CHART_DATA.t_loss, [t_loss])
             CHART_DATA.t_acc = np.append(CHART_DATA.t_acc, [t_acc])
             CHART_DATA.t_acc_unique_hits = np.append(CHART_DATA.t_acc_unique_hits, [len(t_acc_hit_ids)])
+            CHART_DATA.layer_preview, CHART_DATA.layer_preview_labels = prepare_excerpt_tokens(model.embed.weight, t_acc_hits_by_id, tok)
 
             maybe_warmup = f"WARMUP {i+1}/{WARMUP_ROUNDS} | " if i < WARMUP_ROUNDS else ""
 
@@ -489,7 +549,7 @@ def main():
             if i % V_INTERVAL == 0:
 
                 v_start = time.perf_counter()
-                v_loss, v_acc_hit_cnt, v_acc_cnt, v_acc_hit_ids = t_v_step(model, v_batch, opt, False)
+                v_loss, v_acc_hit_cnt, v_acc_cnt, v_acc_hit_id_set, _v_acc_hits_by_id = t_v_step(model, v_batch, opt, False)
                 v_end = time.perf_counter()
 
                 print(f"train_step() took {v_end - v_start:.5}s")
@@ -498,7 +558,7 @@ def main():
 
                 v_acc = v_acc_hit_cnt / v_acc_cnt
 
-                v_acc_hit_ids = sorted(list(v_acc_hit_ids))
+                v_acc_hit_ids = sorted(list(v_acc_hit_id_set))
 
                 v_hits_decoded = tok.decode(v_acc_hit_ids)
 
