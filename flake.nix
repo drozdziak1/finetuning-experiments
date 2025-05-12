@@ -28,7 +28,7 @@
         };
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [tinygrad-olay];
+          overlays = [ tinygrad-olay ];
           config = {
             allowUnfree = true;
           };
@@ -46,7 +46,8 @@
             tiktoken
             tinygrad
             tokenizers
-            torch
+            torchvision
+            # torchWithCuda
             transformers
             tqdm
           ]
@@ -63,7 +64,7 @@
             rocmPackages_6.rocm-comgr
           ];
           nativeBuildInputs = buildInputs;
-          CUDA_PATH=pkgs.cudatoolkit.out;
+          CUDA_PATH = pkgs.cudatoolkit.out;
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath buildInputs;
         };
       }
