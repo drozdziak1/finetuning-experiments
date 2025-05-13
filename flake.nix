@@ -32,24 +32,24 @@
           config = {
             allowUnfree = true;
           };
+          cudaSupport = true;
         };
         python-env = pkgs.python3.withPackages (
           ps: with ps; [
             black
+            datasets
             ipdb
             ipython
             matplotlib
             mypy
             polars
             python-lsp-server
-            datasets
             tiktoken
             tinygrad
             tokenizers
-            torchvision
-            # torchWithCuda
-            transformers
+            torchWithCuda
             tqdm
+            transformers
           ]
         );
       in
