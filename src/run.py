@@ -2,7 +2,7 @@ from tinygrad import Context, Device, dtypes, nn
 from tinygrad.engine.jit import TinyJit
 from tinygrad.helpers import trange
 from tinygrad.nn import LayerNorm, Linear, Embedding
-from tinygrad.nn.optim import AdamW, Optimizer
+from tinygrad.nn.optim import AdamW, Optimizer, OptimizerGroup
 from tinygrad.tensor import Tensor
 
 from os import getenv
@@ -13,6 +13,7 @@ from lr_scheduler import CosineAnnealingLR, LR_Scheduler
 
 import datasets
 import ipdb
+import math
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import numpy as np
@@ -37,10 +38,6 @@ DS_QUICK = bool(getenv("DS_QUICK", False))
 # Whether to draw the charts window
 CHART = bool(getenv("CHART", False))
 
-CHART_EXCERPT_DIM = 24
-
-CHART_EXCERPT_TOPK = 8
-
 BATCH_SIZE = 128
 
 MINIBATCH_SIZE = 4
@@ -57,6 +54,8 @@ WARMUP_LR = 6e-5
 WARMUP_ROUNDS = 2000
 
 EPSILON = 1e-7
+
+MAX_NORM = 1.0 # Max l2 norm for gradients
 
 TOPK_K = 1
 
@@ -78,24 +77,37 @@ class LRSchedWithWarmup:
     Shoves a bunch of warmup steps before the specified Scheduler begins its first step
     """
 
-    def __init__(self, warmup_rounds: int, next_lr: float, opt: Optimizer, next_scheduler_ctor, *args, **kwargs):
+    def __init__(self, warmup_rounds: int, start_lr: float, next_lr: float, opt: Optimizer, next_scheduler_ctor, *args, **kwargs):
         self.warmup_rounds = warmup_rounds
         self.next_lr = next_lr
         self.opt = opt
-        self.cur_step = 0
+        self.cur_step = 1
 
-        self.start_lr = self.opt.lr
+        self.start_lr = start_lr
+
+        self._set_lr(start_lr)
 
         self.next_scheduler_ctor = next_scheduler_ctor
         self.next_scheduler_args = args
         self.next_scheduler_kwargs = kwargs
 
+    def _set_lr(self, new_lr):
+        opts = []
+
+        if isinstance(self.opt, OptimizerGroup):
+            opts = self.opt.optimizers
+        else:
+            opts = [self.opt]
+        
+        for opt in opts:
+            opt.lr.assign([new_lr])
+
 
     def step(self, *args, **kwargs):
         if self.cur_step <= self.warmup_rounds:
-            new_lr = (self.next_lr - self.start_lr) * self.cur_step / self.warmup_rounds
+            new_lr = self.next_lr * self.cur_step / self.warmup_rounds
 
-            self.opt.lr.assign(new_lr)
+            self._set_lr(new_lr)
 
         if self.cur_step == self.warmup_rounds:
             self.opt.lr.assign(Tensor([self.next_lr], requires_grad=False, device=self.opt.device, dtype=self.opt.lr.dtype))
@@ -117,8 +129,6 @@ class ChartData:
         self.v_loss = np.array([])
         self.v_acc = np.array([])
         self.v_acc_unique_hits = np.array([])
-        self.layer_preview = np.eye(CHART_EXCERPT_TOPK, CHART_EXCERPT_DIM)
-        self.layer_preview_labels = list(range(CHART_EXCERPT_TOPK))
 
         self.ax_loss.set_title("Loss")
         self.ax_loss.set_xlabel("training batch")
@@ -134,24 +144,9 @@ class ChartData:
 
         self.ax_layer_preview.set_title("Excerpt from embed layer")
 
-        chart_excerpt_range = EMBED_DIM // CHART_EXCERPT_DIM
-        chart_excerpt_dim_ranges = [f"{i*chart_excerpt_range}..{(i+1)*chart_excerpt_range}" for i in range(CHART_EXCERPT_DIM)]
-
-        self.ax_layer_preview.set_xticks(range(CHART_EXCERPT_DIM), labels=chart_excerpt_dim_ranges, rotation=45, ha="right", rotation_mode="anchor")
-
         self.ln_t_loss, self.ln_v_loss = self.ax_loss.plot([], self.t_loss, 'b-', [], [], 'r--')
         self.ln_t_acc, self.ln_v_acc = self.ax_acc.plot([], [], 'b-', [], [], 'r--')
         self.ln_t_acc_unique_hits, self.ln_v_acc_unique_hits = self.ax_acc_unique_hits.plot([], [], 'b-', [], [], 'r--')
-
-        self.im_layer_preview = self.ax_layer_preview.imshow(self.layer_preview)
-
-        self.layer_preview_text = [[None] * len(self.layer_preview[0]) for _ in range(len(self.layer_preview))]
-
-        for i in range(len(self.layer_preview)):
-            for j in range(len(self.layer_preview[i])):
-                self.layer_preview_text[i][j] = self.ax_layer_preview.text(j, i, f"{self.layer_preview[i, j]:.2}", ha="center", va="center", color="w", fontsize="xx-small", fontstretch=1000)
-
-        # self.fig.tight_layout()
 
 
     def plot(self, _i):
@@ -167,22 +162,12 @@ class ChartData:
         self.ln_t_acc_unique_hits.set_data(t_idx, self.t_acc_unique_hits)
         self.ln_v_acc_unique_hits.set_data(v_idx, self.v_acc_unique_hits)
 
-        self.ax_layer_preview.set_yticks(range(len(self.layer_preview_labels)), labels=self.layer_preview_labels)
-        self.im_layer_preview.set_data(self.layer_preview)
-
-        for i in range(len(self.layer_preview)):
-            for j in range(len(self.layer_preview[i])):
-                self.layer_preview_text[i][j].set_text(f"{self.layer_preview[i, j]:.2}")
-
         self.ax_loss.relim()
         self.ax_loss.autoscale()
         self.ax_acc.relim()
         self.ax_acc.autoscale()
         self.ax_acc_unique_hits.relim()
         self.ax_acc_unique_hits.autoscale()
-
-        # self.im_layer_preview.relim()
-        self.im_layer_preview.autoscale()
 
 
 CHART_DATA = ChartData()
@@ -208,8 +193,8 @@ def sig_handler(_i, _whatever):
     print(f"Cleaning up... (Send SIGINT or SIGTERM again to quit now)")
     QUITTING = True
 
-signal.signal(signal.SIGINT, sig_handler)
-signal.signal(signal.SIGTERM, sig_handler)
+# signal.signal(signal.SIGINT, sig_handler)
+# signal.signal(signal.SIGTERM, sig_handler)
 
 class Transformer:
     def __init__(self, ctx_size, num_blocks, embed_dim, num_heads, ff_dim, vocab_size, dropout):
@@ -232,11 +217,23 @@ class Transformer:
 
         self.ln = LayerNorm(embed_dim, eps=EPSILON)
 
-        self.unembed = Linear(embed_dim, self.vocab_size)
+        self.unembed = Linear(embed_dim, self.vocab_size, bias=False)
 
         self.embed.weight = self.unembed.weight
 
-    def __call__(self, x: Tensor):
+        for pn, p in nn.state.get_state_dict(self).items():
+            if pn.endswith("atn_out_w") or pn.endswith("ff2.weight"):
+                print(f"Setting {pn} using c_proj rule")
+                p.assign(Tensor.normal(p.shape, mean=0.0, std=0.02/math.sqrt(2 * self.num_blocks), dtype=p.dtype, device=p.device))
+            # elif pn.endswith("bias"):
+            #     print(f"Setting {pn} using bias rule")
+            #     p.assign(p.zeros_like())
+            # else:
+            #     print(f"Setting {pn} using default rule")
+            #     p.assign(Tensor.normal(p.shape, mean=0.0, std=0.02, dtype=p.dtype, device=p.device))
+                
+
+    def __call__(self, x: Tensor, y_gt: Tensor = None):
         """
         X: (B, T)
         """
@@ -253,9 +250,30 @@ class Transformer:
 
         x_ln = self.ln(x_refined)
 
-        x_unembed = self.unembed(x_ln).softmax()
+        x_unembed = self.unembed(x_ln)
+
+        if y_gt is not None:
+            loss = x_unembed.sparse_categorical_crossentropy(y_gt)
+            return x_unembed, loss
 
         return x_unembed
+
+    def optim_init(self, lr, beta1, beta2, wd):
+        param_dict = nn.state.get_state_dict(self)
+
+        wd_params = []
+        nowd_params = []
+
+        for pn, p in param_dict.items():
+            if len(p.shape) >= 2:
+                wd_params.append(p)
+            else:
+                nowd_params.append(p)
+                
+        wd_opt = AdamW(wd_params, lr, b1=beta1, b2=beta2, weight_decay=wd)
+        nowd_opt = AdamW(nowd_params, lr, b1=beta1, b2=beta2, weight_decay=0.0)
+
+        return OptimizerGroup(wd_opt, nowd_opt)
 
 class TBlock:
     def __init__(self, embed_dim, num_heads, ff_dim, dropout):
@@ -345,15 +363,35 @@ def dataset_batch_iter(ds_iter, tokenizer, batch_size, minibatch_size, ctx_size=
 
         yield batch
 
+def clip_grad_norm(opt, max_norm=1.0):
+    l2_sum = Tensor(0.0, device=opt.params[0].device, dtype=opt.params[0].dtype, requires_grad=False)
+
+    for p in opt.params:
+        if p.grad is not None:
+            l2_sum = l2_sum + p.grad.square().sum()
+
+
+    l2_norm = l2_sum.sqrt()
+
+    if l2_norm.item() > max_norm:
+        factor = max_norm / l2_norm
+
+        print(f"Clipping grads by factor of {factor.item():,}")
+
+        for p in opt.params:
+            if p.grad is not None:
+                new_grad = p * factor
+                new_grad.requires_grad = False
+                p.grad.assign(new_grad)
+    
+
 def t_v_step(model: Transformer, batch: Tensor, opt: Optimizer, train: bool):
     @TinyJit
     def mb_step(model, x, y_gt):
 
-        y_hat = model(x)
+        y_hat, loss = model(x, y_gt)
 
-        losses = y_hat.sparse_categorical_crossentropy(y_gt, reduction = "none")
-
-        loss = losses.mean() / BATCH_SIZE # Internally, x-entropy implementation is not too fp16-friendly, so we do the mean on our own
+        loss = loss / BATCH_SIZE # Internally, x-entropy implementation is not too fp16-friendly, so we do the mean on our own
 
         loss.backward()
 
@@ -395,8 +433,10 @@ def t_v_step(model: Transformer, batch: Tensor, opt: Optimizer, train: bool):
     print(f"fwd took {mb_iter_end - mb_iter_start:.5}s")
 
     if train:
+        clip_grad_norm(opt, MAX_NORM)
         opt_step_start = time.perf_counter()
         opt.step()
+        opt.zero_grad()
         opt_step_end = time.perf_counter()
         print(f"bwd took {opt_step_end - opt_step_start:.5}s")
 
@@ -437,27 +477,6 @@ def gen_step(model: Transformer, tokenizer: Tokenizer):
 
     return tokenizer.decode(tokens)
 
-def prepare_excerpt_tokens(w_embed, t_acc_hits_by_id, tok):
-    topk_values, topk_indices = t_acc_hits_by_id[:-1].topk(CHART_EXCERPT_TOPK)
-
-    downsampled = w_embed[topk_indices].reshape(None, CHART_EXCERPT_DIM, -1).mean(-1).numpy()
-
-    topk_values_np = topk_values.numpy()
-
-    labels = [f"{tok.decode([token])}:{topk_values_np[i]}" for i, token in enumerate(topk_indices.numpy())]
-
-    n_found = topk_indices.shape[0]
-    n_missing = CHART_EXCERPT_TOPK - n_found 
-
-    if n_missing >= 0:
-        downsampled = np.pad(downsampled, [(0, n_missing), (0, 0)], mode="constant")
-        labels = labels + ["<none>"] * n_missing
-    else:
-        downsampled = downsampled[:CHART_EXCERPT_TOPK]
-        labels = labels[:CHART_EXCERPT_TOPK]
-
-    return downsampled, labels
-
 def main():
     tok = load_tokenizer()
 
@@ -476,14 +495,11 @@ def main():
     # Sharding
     for _k, x in nn.state.get_state_dict(model).items(): x.to_(GPUS)
 
-    params = nn.state.get_parameters(model)
 
-    param_count = sum(map(lambda t: len(t.reshape(-1)), params))
+    # opt = model.optim_init(LR, 0.9, 0.95, 0.1)
+    opt = AdamW(nn.state.get_parameters(model), b1=0.9, b2=0.95, weight_decay=0.1)
 
-    print(f"Training a {param_count} parameter model")
-
-    opt = AdamW(params=params, lr=WARMUP_LR, b2=0.95, weight_decay=0.1)
-    lr_sched = LRSchedWithWarmup(WARMUP_ROUNDS, LR, opt, CosineAnnealingLR, opt, 100000)
+    lr_sched = LRSchedWithWarmup(WARMUP_ROUNDS, WARMUP_LR, LR, opt, CosineAnnealingLR, opt, 100000)
 
     # I'm a bit tired of setting DEBUG=2 manually when playing with the  metaparameters
     first_pass = True
@@ -538,7 +554,6 @@ def main():
             CHART_DATA.t_loss = np.append(CHART_DATA.t_loss, [t_loss])
             CHART_DATA.t_acc = np.append(CHART_DATA.t_acc, [t_acc])
             CHART_DATA.t_acc_unique_hits = np.append(CHART_DATA.t_acc_unique_hits, [len(t_acc_hit_ids)])
-            CHART_DATA.layer_preview, CHART_DATA.layer_preview_labels = prepare_excerpt_tokens(model.embed.weight, t_acc_hits_by_id, tok)
 
             maybe_warmup = f"WARMUP {i+1}/{WARMUP_ROUNDS} | " if i < WARMUP_ROUNDS else ""
 
