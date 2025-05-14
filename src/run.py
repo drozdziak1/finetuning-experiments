@@ -57,7 +57,7 @@ EPSILON = 1e-7
 
 MAX_NORM = 1.0 # Max l2 norm for gradients
 
-TOPK_K = 1
+TOPK_K = 8
 
 N_GEN_TOKENS = 8
 
@@ -119,56 +119,6 @@ class LRSchedWithWarmup:
         self.cur_step += 1
 
 
-class ChartData:
-    def __init__(self):
-        self.fig, (self.ax_loss, self.ax_acc, self.ax_acc_unique_hits, self.ax_layer_preview) = plt.subplots(4, 1, height_ratios=[1, 1, 1, 3])
-
-        self.t_loss = np.array([])
-        self.t_acc = np.array([])
-        self.t_acc_unique_hits = np.array([])
-        self.v_loss = np.array([])
-        self.v_acc = np.array([])
-        self.v_acc_unique_hits = np.array([])
-
-        self.ax_loss.set_title("Loss")
-        self.ax_loss.set_xlabel("training batch")
-        self.ax_loss.set_ylabel("cat x-entropy loss")
-
-        self.ax_acc.set_title("Accuracy")
-        self.ax_acc.set_xlabel("training batch")
-        self.ax_acc.set_ylabel("accuracy")
-
-        self.ax_acc_unique_hits.set_title("Unique accuracy hits")
-        self.ax_acc_unique_hits.set_xlabel("training batch")
-        self.ax_acc_unique_hits.set_ylabel("n unique correct tokens")
-
-        self.ax_layer_preview.set_title("Excerpt from embed layer")
-
-        self.ln_t_loss, self.ln_v_loss = self.ax_loss.plot([], self.t_loss, 'b-', [], [], 'r--')
-        self.ln_t_acc, self.ln_v_acc = self.ax_acc.plot([], [], 'b-', [], [], 'r--')
-        self.ln_t_acc_unique_hits, self.ln_v_acc_unique_hits = self.ax_acc_unique_hits.plot([], [], 'b-', [], [], 'r--')
-
-
-    def plot(self, _i):
-        t_idx = np.arange(len(self.t_loss))
-        v_idx = np.arange(len(self.v_loss)) * V_INTERVAL
-
-        self.ln_t_loss.set_data(t_idx, self.t_loss)
-        self.ln_v_loss.set_data(v_idx, self.v_loss)
-
-        self.ln_t_acc.set_data(t_idx, self.t_acc)
-        self.ln_v_acc.set_data(v_idx, self.v_acc)
-
-        self.ln_t_acc_unique_hits.set_data(t_idx, self.t_acc_unique_hits)
-        self.ln_v_acc_unique_hits.set_data(v_idx, self.v_acc_unique_hits)
-
-        self.ax_loss.relim()
-        self.ax_loss.autoscale()
-        self.ax_acc.relim()
-        self.ax_acc.autoscale()
-        self.ax_acc_unique_hits.relim()
-        self.ax_acc_unique_hits.autoscale()
-
 
 CHART_DATA = ChartData()
 
@@ -183,18 +133,9 @@ def save_plot():
     except Exception as e:
         print(f"Could not save plot:\n{e}")
 
-QUITTING = False
 
-def sig_handler(_i, _whatever):
-    global QUITTING
-    if QUITTING:
-        print("Quitting now!")
-        sys.exit(1)
-    print(f"Cleaning up... (Send SIGINT or SIGTERM again to quit now)")
-    QUITTING = True
-
-# signal.signal(signal.SIGINT, sig_handler)
-# signal.signal(signal.SIGTERM, sig_handler)
+signal.signal(signal.SIGINT, sig_handler)
+signal.signal(signal.SIGTERM, sig_handler)
 
 class Transformer:
     def __init__(self, ctx_size, num_blocks, embed_dim, num_heads, ff_dim, vocab_size, dropout):
@@ -326,42 +267,6 @@ class TBlock:
         return x
 
 
-def load_tokenizer(model_name="gpt2"):
-    return Tokenizer.from_pretrained(model_name)
-
-def load_dataset():
-    if DS_QUICK:
-        ds = datasets.load_dataset("HuggingFaceFW/fineweb", data_files="sample/100BT/000_00000.parquet", split="train", )
-    else:
-        ds = datasets.load_dataset("HuggingFaceFW/fineweb", "sample-100BT", split="train")
-
-    ds_iter = ds.to_iterable_dataset().shuffle(buffer_size=10_000, seed=RNG_SEED).iter(1)
-
-    return ds_iter
-
-def dataset_batch_iter(ds_iter, tokenizer, batch_size, minibatch_size, ctx_size=CTX_SIZE):
-    """
-    each iteration yields a training batch
-    """
-    bufs = [[[] for _ in range(minibatch_size)] for _ in range(batch_size)]
-    while True:
-        batch = []
-        for b_i in range(batch_size):
-            minibatch = []
-            for mb_i in range(minibatch_size):
-                while len(bufs[b_i][mb_i]) < ctx_size + 1:
-                    bufs[b_i][mb_i] += tokenizer.encode("<|endoftext|>").ids
-                    txt = next(ds_iter)["text"][0]
-                    bufs[b_i][mb_i] += tokenizer.encode(txt).ids
-
-                minibatch_item = bufs[b_i][mb_i][:ctx_size + 1]
-
-                bufs[b_i][mb_i] = bufs[b_i][mb_i][ctx_size + 1:]
-
-                minibatch += [minibatch_item]
-            batch += [minibatch]
-
-        yield batch
 
 def clip_grad_norm(opt, max_norm=1.0):
     l2_sum = Tensor(0.0, device=opt.params[0].device, dtype=opt.params[0].dtype, requires_grad=False)
@@ -376,7 +281,7 @@ def clip_grad_norm(opt, max_norm=1.0):
     if l2_norm.item() > max_norm:
         factor = max_norm / l2_norm
 
-        print(f"Clipping grads by factor of {factor.item():,}")
+        print(f"Clipping grads using factor {factor.item():5.5}")
 
         for p in opt.params:
             if p.grad is not None:
@@ -456,24 +361,26 @@ def gen_step(model: Transformer, tokenizer: Tokenizer):
 
         last_y = ys[0, len(tokens) - 1]
 
-        _topk_values, topk_indices = last_y.topk(TOPK_K, dim=-1)
+        topk_values, topk_indices = last_y.topk(TOPK_K, dim=-1)
 
-        return topk_indices
+        return topk_values.softmax(), topk_indices
 
     x = tokenizer.encode("<|endoftext|>").ids * CTX_SIZE
 
-    tokens = tokenizer.encode("My name is").ids
+    tokens = tokenizer.encode("My answer to your question is").ids
 
     for i in range(N_GEN_TOKENS):
 
         for j in range(len(tokens)):
             x[j] = tokens[j]
 
-        topk_indices = gen_token_step(model, Tensor(x, requires_grad=False).unsqueeze(0).to_(GPUS))
+        topk_values, topk_indices = gen_token_step(model, Tensor(x, requires_grad=False).unsqueeze(0).to_(GPUS))
 
-        tok_id = NP_RNG.choice(topk_indices.reshape(-1).numpy())
+        tok_idx = NP_RNG.multinomial(1, topk_values.numpy(), size=1).argmax()
 
-        tokens += [tok_id]
+        tok_id = topk_indices.numpy()[tok_idx]
+
+        tokens += [tok_id.item()]
 
     return tokenizer.decode(tokens)
 
@@ -495,7 +402,6 @@ def main():
     # Sharding
     for _k, x in nn.state.get_state_dict(model).items(): x.to_(GPUS)
 
-
     # opt = model.optim_init(LR, 0.9, 0.95, 0.1)
     opt = AdamW(nn.state.get_parameters(model), b1=0.9, b2=0.95, weight_decay=0.1)
 
@@ -511,7 +417,7 @@ def main():
 
     for i in range(N_BATCHES):
         if CHART:
-            plt.pause(1)
+            plt.pause(0.25)
 
         if QUITTING:
             break
