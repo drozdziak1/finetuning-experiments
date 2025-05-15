@@ -5,15 +5,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import datetime
 import math
 import sys
+import time
 
 from torch import Tensor
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
 from tqdm import tqdm
 
 from config import TrafoConfig
 from data_utils import load_dataset, load_tokenizer, dataset_batch_iter
-from my_globals import CHART_DATA, CFG, QUITTING
+from my_globals import CHART_DATA, CFG
+
+from typing import List
 
 class MHSA(nn.Module):
     def __init__(self, cfg: TrafoConfig):
@@ -124,7 +130,36 @@ class Trafo(nn.Module):
 
         return logits, other
 
-def t_v_step(model, scaler, device, batch, in_eval=False):
+    @torch.no_grad()
+    def generate(self, encoded_prompt: List[int], n_new_tokens: int, separator: int, topk: int, temperature: float, device):
+        total_gen_len = len(encoded_prompt) + n_new_tokens
+        assert total_gen_len <= self.cfg.ctx_size, f"total desired length must not exceed context size ({total_gen_len}, {self.cfg.ctx_size}, respectively)"
+
+        tokens = encoded_prompt
+
+        tok_tensor = torch.full((self.cfg.ctx_size,), separator, dtype=torch.long, device=device)
+
+        for i in range(n_new_tokens):
+
+            for tok_i, tok in enumerate(tokens):
+                tok_tensor[tok_i] = tok
+
+            logits, _ = self(tok_tensor.unsqueeze(0))
+
+            last_logit: Tensor = logits[0, len(tokens) - 1]
+
+            topk_values, topk_indices = last_logit.topk(topk)
+
+            tok_idx = F.softmax(topk_values, dim=-1).multinomial(1)
+
+            tok_id = topk_indices[tok_idx]
+
+            tokens += tok_id.tolist()
+
+        return tokens
+         
+
+def t_v_step(model, scaler, device, batch, ddp=False, master_process=True, in_eval=False):
     torch.set_grad_enabled(not in_eval)
     if in_eval:
         model.eval()
@@ -134,7 +169,12 @@ def t_v_step(model, scaler, device, batch, in_eval=False):
 
     batch_acc_hit_ids = set()
 
-    for mbatch in tqdm(batch, unit="mbatches"):
+    mbatch_iter = tqdm(batch, unit="mbatches") if master_process and len(batch) >= 40 else batch
+
+    for idx, mbatch in enumerate(mbatch_iter):
+        if ddp:
+            model.require_backward_grad_sync = idx == len(batch) - 1
+
         mbatch_tensor = torch.tensor(mbatch, dtype=torch.long, device=device)
 
         x = mbatch_tensor[:, :-1]
@@ -158,17 +198,20 @@ def t_v_step(model, scaler, device, batch, in_eval=False):
 
     return batch_loss, batch_acc, batch_acc_hit_ids
 
-def t_v_status(iter_idx, n_iter, batch_loss, batch_acc, batch_unique_ids, tok, in_eval=False):
+def t_v_status(t0, iter_idx, n_iter, batch_loss, batch_acc, batch_unique_ids, batch_proc_duration, in_eval=False):
     mode = 'V' if in_eval else 'T'
 
-    decoded = [tok.decode([t_id]) for t_id in batch_unique_ids]
+    elapsed = time.time() - t0
 
-    print(f"{mode} Step {iter_idx:7} of {n_iter} | {mode} loss {batch_loss:2.5} | {mode} acc {batch_acc:1.5} | {mode} unique tokens: {len(batch_unique_ids):6} {decoded}")
+    elapsed_str = str(datetime.timedelta(seconds=int(elapsed)))
 
-def get_lr(it, learning_rate, warmup_iters, min_lr):
+    print(f"{elapsed_str} | {mode} Step {iter_idx:7} of {n_iter} | {mode} loss {batch_loss:2.5} | {mode} acc {batch_acc:2.5} | {mode} unique tokens: {len(batch_unique_ids):6} | {mode} batch time: {batch_proc_duration:2.5}")
+
+# copied from nanoGPT
+def get_lr(it, min_lr, max_lr, warmup_iters, lr_decay_iters):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
-        return learning_rate * (it + 1) / (warmup_iters + 1)
+        return max_lr * (it + 1) / (warmup_iters + 1)
     # 2) if it > lr_decay_iters, return min learning rate
     if it > lr_decay_iters:
         return min_lr
@@ -176,24 +219,36 @@ def get_lr(it, learning_rate, warmup_iters, min_lr):
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
+    return min_lr + coeff * (max_lr - min_lr)
     
 
 def main():
     assert torch.cuda.is_available(), "CUDA is not available"
 
+    t0 = time.time()
+
     cfg = CFG
 
     torch.manual_seed(cfg.rng_seed)
-
     torch.set_float32_matmul_precision('high')
+
+    ddp_device = None
+
+    if cfg.ddp:
+        init_process_group(backend=cfg.ddp_backend)
+        cfg.device = f"{cfg.device}:{cfg.ddp_local_rank}"
+
+        torch.cuda.set_device(cfg.device)
 
     tok = load_tokenizer()
 
     tcfg = TrafoConfig(embed_dim=768, ctx_size=1024, vocab_size=tok.get_vocab_size(), num_blocks=12, num_heads=12, qkv_bias=True, ff_bias=True, is_causal=True)
 
-    model = torch.compile(Trafo(tcfg).to(cfg.device))
-    # model = Trafo(tcfg).to(cfg.device)
+    model_raw = Trafo(tcfg).to(cfg.device)
+    model_compiled = torch.compile(model_raw)
+
+    if cfg.ddp:
+        model = DDP(model_compiled)
 
     ds_iter = load_dataset(cfg.ds_quick, cfg.rng_seed)
 
@@ -209,55 +264,75 @@ def main():
         {"params": nodecay_params, "weight_decay": 0.0}
     ]
 
-    opt = torch.optim.AdamW(optim_groups, lr=cfg.lr, betas=(0.9, 0.95), fused=True)
+    opt = torch.optim.AdamW(optim_groups, lr=cfg.max_lr, betas=(0.9, 0.95), fused=True)
 
-    scaler = torch.amp.GradScaler('cuda',)
+    scaler = torch.amp.GradScaler('cuda', enabled=(cfg.dtype_name != "float32"))
 
     v_batch = next(batch_iter)
 
-    if cfg.chart:
+    if cfg.chart and cfg.master_process:
         ani = animation.FuncAnimation(CHART_DATA.fig, CHART_DATA.plot, interval=1000, blit=False)
 
         plt.show(block=False)
 
     for iter_idx in range(cfg.n_iter):
-        if cfg.chart:
+        if cfg.chart and cfg.master_process:
             plt.pause(0.25)
 
-        if QUITTING:
-            CHART_DATA.save_plot()
-            sys.exit(0)
+        if cfg.quitting:
+            break
 
-        lr = get_lr(iter_idx, cfg.lr, cfg.warmup_iters, cfg.min_lr)
+        lr = get_lr(iter_idx, cfg.min_lr, cfg.max_lr, cfg.warmup_iters, cfg.n_iter)
 
         for param_group in opt.param_groups:
             param_group['lr'] = lr
 
         batch = next(batch_iter)
 
-        batch_loss, batch_acc, batch_acc_hit_ids = t_v_step(model, scaler, cfg.device, batch, False)
+        t_start = time.perf_counter()
+        batch_loss, batch_acc, batch_acc_hit_ids = t_v_step(model, scaler, cfg.device, batch, cfg.ddp, cfg.master_process, False)
 
-        t_v_status(iter_idx, cfg.n_iter, batch_loss.item(), batch_acc.item(), sorted(list(batch_acc_hit_ids)), tok, False)
+        if cfg.master_process:
+            elapsed = time.perf_counter() - t_start
+            t_v_status(t0, iter_idx, cfg.n_iter, batch_loss.item(), batch_acc.item(), sorted(list(batch_acc_hit_ids)), elapsed, False)
 
         CHART_DATA.update(batch_loss.tolist(), batch_acc.tolist(), [len(batch_acc_hit_ids)])
 
         del batch_loss
 
         scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
         scaler.step(opt)
         scaler.update()
 
         opt.zero_grad(set_to_none=True)
 
-        if iter_idx % cfg.v_interval == 0:
-            v_batch_loss, v_batch_acc, v_batch_acc_hit_ids = t_v_step(model, scaler, cfg.device, v_batch, True)
+        if (iter_idx % cfg.v_interval == 0) and cfg.master_process:
+            v_start = time.perf_counter()
 
-            t_v_status(iter_idx, cfg.n_iter, v_batch_loss.item(), v_batch_acc.item(), sorted(list(v_batch_acc_hit_ids)), tok, True)
+            v_start = time.perf_counter()
+            v_batch_loss, v_batch_acc, v_batch_acc_hit_ids = t_v_step(model, scaler, cfg.device, v_batch, cfg.master_process, True)
+
+            elapsed = time.perf_counter() - v_start
+            t_v_status(t0, iter_idx, cfg.n_iter, v_batch_loss.item(), v_batch_acc.item(), sorted(list(v_batch_acc_hit_ids)), elapsed, True)
 
             CHART_DATA.update([], [], [], v_batch_loss.tolist(), v_batch_acc.tolist(), [len(v_batch_acc_hit_ids)])
 
+        if (iter_idx % cfg.gen_interval == 0) and cfg.master_process:
+            tokens = model_compiled.generate(tok.encode("My answer to your question about apples is:").ids, cfg.gen_n_tokens, tok.encode("<|endoftext|>").ids[0], cfg.gen_topk_k, cfg.gen_temperature, cfg.device)
+
+            decoded = tok.decode(tokens)
+
+            print(f"Gen: {decoded}")
+
+    if cfg.chart and cfg.master_process:
+        CHART_DATA.save_plot()
+
+    if cfg.ddp:
+        destroy_process_group()
+
+    print("Bye!")
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()

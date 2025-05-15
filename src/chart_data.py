@@ -2,7 +2,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 class ChartData:
-    def __init__(self, v_interval: int):
+    def __init__(self, v_interval: int, master_process=True):
+        if not master_process:
+            self.update = lambda *args, **kwargs: None
+            return
+        
         self.fig, (self.ax_loss, self.ax_acc, self.ax_acc_unique_hits) = plt.subplots(3, 1)
 
         self.v_interval = v_interval
