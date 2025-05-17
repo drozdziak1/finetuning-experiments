@@ -19,7 +19,7 @@ from contextlib import nullcontext
 from typing import List
 
 from config import TrafoConfig
-from data_utils import load_dataset, load_tokenizer, dataset_batch_iter
+from data_utils import load_dataset, load_tokenizer, dataset_batch_iter, NBBatchQueue
 from my_globals import CHART_DATA, CFG
 
 class MHSA(nn.Module):
@@ -261,7 +261,12 @@ def main():
 
     ds_iter = load_dataset(cfg.ds_quick, cfg.rng_seed)
 
-    batch_iter = dataset_batch_iter(ds_iter, tok, cfg.batch_size, cfg.mbatch_size, tcfg.ctx_size)
+    raw_batch_iter = dataset_batch_iter(ds_iter, tok, cfg.batch_size, cfg.mbatch_size, tcfg.ctx_size)
+
+    batch_iter = NBBatchQueue(raw_batch_iter, cfg.max_batch_prefetch)
+
+    del raw_batch_iter
+
 
     all_params = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
 
@@ -277,7 +282,7 @@ def main():
 
     scaler = torch.amp.GradScaler('cuda', enabled=(cfg.dtype_name != "float32"))
 
-    v_batch = next(batch_iter)
+    v_batch = batch_iter.next_item()
 
     if cfg.chart and cfg.master_process:
         ani = animation.FuncAnimation(CHART_DATA.fig, CHART_DATA.plot, interval=1000, blit=False)
@@ -294,10 +299,22 @@ def main():
         for param_group in opt.param_groups:
             param_group['lr'] = lr
 
-        batch = next(batch_iter)
 
+        batch_load_start = time.perf_counter()
+        t_batch = batch_iter.next_item()
+        batch_load_time = time.perf_counter() - batch_load_start
+
+        if t_batch is None:
+            print("Batch queue exhausted, bailing out...")
+            break
+
+        if cfg.debug_perf:
+            rank = cfg.ddp_rank if cfg.ddp else 0
+            print(f"Rank {rank}: batch load took {batch_load_time:3.5}s")
+            
         t_start = time.perf_counter()
-        batch_loss, batch_acc, batch_acc_hit_ids = t_v_step(model, scaler, autocast_ctx, cfg.device, batch, cfg.ddp, cfg.master_process, False)
+
+        batch_loss, batch_acc, batch_acc_hit_ids = t_v_step(model, scaler, autocast_ctx, cfg.device, t_batch, cfg.ddp, cfg.master_process, False)
 
         if cfg.master_process:
             elapsed = time.perf_counter() - t_start
@@ -341,7 +358,7 @@ def main():
     if cfg.ddp:
         destroy_process_group()
 
-    print("Bye!")
+    print("main(): Bye!")
     sys.exit(0)
 
 if __name__ == "__main__":

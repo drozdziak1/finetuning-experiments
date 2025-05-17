@@ -38,6 +38,8 @@ class Config:
     gen_topk_k: int = 50
     gen_temperature: float = 0.7
     quitting: bool = False
+    max_batch_prefetch: int = 4
+    debug_perf: bool = bool(os.getenv("DEBUG_PERF", False))
 
 
 @dataclass

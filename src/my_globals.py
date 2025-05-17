@@ -2,6 +2,7 @@ from chart_data import ChartData
 
 from config import Config
 
+import os
 import signal
 import sys
 
@@ -13,9 +14,9 @@ CHART_DATA = ChartData(CFG.v_interval, CFG.master_process)
 def sig_handler(_i, _whatever):
     global CFG
     if CFG.quitting:
-        print("Quitting now!")
+        print(f"Process {os.getpid()}: Quitting now!")
         sys.exit(1)
-    print(f"Cleaning up... (Send SIGINT or SIGTERM again to quit now)")
+    print(f"Process {os.getpid()}: Cleaning up... (Send SIGINT or SIGTERM again to quit now)")
     CFG.quitting = True
 
 signal.signal(signal.SIGINT, sig_handler)
