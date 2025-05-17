@@ -15,11 +15,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from tqdm import tqdm
 
+from contextlib import nullcontext
+from typing import List
+
 from config import TrafoConfig
 from data_utils import load_dataset, load_tokenizer, dataset_batch_iter
 from my_globals import CHART_DATA, CFG
-
-from typing import List
 
 class MHSA(nn.Module):
     def __init__(self, cfg: TrafoConfig):
@@ -159,7 +160,7 @@ class Trafo(nn.Module):
         return tokens
          
 
-def t_v_step(model, scaler, device, batch, ddp=False, master_process=True, in_eval=False):
+def t_v_step(model, scaler, ctx, device, batch, ddp=False, master_process=True, in_eval=False):
     torch.set_grad_enabled(not in_eval)
     if in_eval:
         model.eval()
@@ -180,10 +181,11 @@ def t_v_step(model, scaler, device, batch, ddp=False, master_process=True, in_ev
         x = mbatch_tensor[:, :-1]
         y_gt = mbatch_tensor[:, 1:]
 
-        y_hat, (mbatch_loss, mbatch_acc, mbatch_acc_hit_ids) = model(x, y_gt)
+        with ctx:
+            y_hat, (mbatch_loss, mbatch_acc, mbatch_acc_hit_ids) = model(x, y_gt)
 
-        mbatch_loss = mbatch_loss / len(batch)
-        mbatch_acc = mbatch_acc / len(batch)
+            mbatch_loss = mbatch_loss / len(batch)
+            mbatch_acc = mbatch_acc / len(batch)
 
         if not in_eval:
             scaler.scale(mbatch_loss).backward()
@@ -230,7 +232,9 @@ def main():
     cfg = CFG
 
     torch.manual_seed(cfg.rng_seed)
-    torch.set_float32_matmul_precision('high')
+
+    if cfg.dtype_name == "float32":
+        torch.set_float32_matmul_precision('high')
 
     ddp_device = None
 
@@ -247,8 +251,13 @@ def main():
     model_raw = Trafo(tcfg).to(cfg.device)
     model_compiled = torch.compile(model_raw)
 
+    autocast_ctx = nullcontext() if cfg.device == "cpu" else torch.amp.autocast(device_type="cuda", dtype=cfg.dtype)
+
+    model = None
     if cfg.ddp:
         model = DDP(model_compiled)
+    else:
+        model = model_compiled
 
     ds_iter = load_dataset(cfg.ds_quick, cfg.rng_seed)
 
@@ -279,8 +288,6 @@ def main():
         if cfg.chart and cfg.master_process:
             plt.pause(0.25)
 
-        if cfg.quitting:
-            break
 
         lr = get_lr(iter_idx, cfg.min_lr, cfg.max_lr, cfg.warmup_iters, cfg.n_iter)
 
@@ -290,7 +297,7 @@ def main():
         batch = next(batch_iter)
 
         t_start = time.perf_counter()
-        batch_loss, batch_acc, batch_acc_hit_ids = t_v_step(model, scaler, cfg.device, batch, cfg.ddp, cfg.master_process, False)
+        batch_loss, batch_acc, batch_acc_hit_ids = t_v_step(model, scaler, autocast_ctx, cfg.device, batch, cfg.ddp, cfg.master_process, False)
 
         if cfg.master_process:
             elapsed = time.perf_counter() - t_start
@@ -298,7 +305,7 @@ def main():
 
         CHART_DATA.update(batch_loss.tolist(), batch_acc.tolist(), [len(batch_acc_hit_ids)])
 
-        del batch_loss
+        del batch_loss, batch_acc, batch_acc_hit_ids
 
         scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
@@ -311,7 +318,7 @@ def main():
             v_start = time.perf_counter()
 
             v_start = time.perf_counter()
-            v_batch_loss, v_batch_acc, v_batch_acc_hit_ids = t_v_step(model, scaler, cfg.device, v_batch, cfg.master_process, True)
+            v_batch_loss, v_batch_acc, v_batch_acc_hit_ids = t_v_step(model, scaler, autocast_ctx, cfg.device, v_batch, cfg.master_process, True)
 
             elapsed = time.perf_counter() - v_start
             t_v_status(t0, iter_idx, cfg.n_iter, v_batch_loss.item(), v_batch_acc.item(), sorted(list(v_batch_acc_hit_ids)), elapsed, True)
@@ -324,6 +331,9 @@ def main():
             decoded = tok.decode(tokens)
 
             print(f"Gen: {decoded}")
+
+        if cfg.quitting:
+            break
 
     if cfg.chart and cfg.master_process:
         CHART_DATA.save_plot()

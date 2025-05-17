@@ -30,13 +30,13 @@ class Config:
     rng_seed: int = 0xdeadbeef + ddp_rank + 1
     v_interval: int = 50
     gen_interval: int = 50
-    batch_size: int = 40 // (ddp_world_size if ddp else 1)
-    mbatch_size: int = 12
-    dtype_name: str = "float32"
+    batch_size: int = 20 // (ddp_world_size if ddp else 1)
+    mbatch_size: int = 24
+    dtype_name: str = os.getenv("DTYPE", "bfloat16")
     dtype = dtype_name2dtype[dtype_name]
     gen_n_tokens: int = 128
-    gen_topk_k: int = 16
-    gen_temperature: float = 0.5
+    gen_topk_k: int = 50
+    gen_temperature: float = 0.7
     quitting: bool = False
 
 
