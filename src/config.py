@@ -15,7 +15,8 @@ class Config:
     min_lr: float = 6e-5
     max_lr: float = 6e-4
     warmup_iters: int = 2_000
-    n_iter: int = 600_000
+    # n_iter: int = 600_000
+    n_iter: int = 6_500
     optim_weight_decay: float = 0.1
     max_grad_norm: float = 1.0
     ds_quick: bool = bool(os.getenv("DS_QUICK", False))

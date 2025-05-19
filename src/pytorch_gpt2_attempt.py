@@ -44,6 +44,27 @@ class MHSA(nn.Module):
         x_out = self.w_atn_out(x_atn.transpose(1, 2).view(xs.size()))
 
         return x_out
+
+class ModifiedMHSA(nn.Module):
+    def __init__(self, cfg: TrafoConfig):
+        super(ModifiedMHSA, self).__init__()
+        self.cfg = cfg
+        self.w_v = nn.Linear(self.cfg.embed_dim, self.cfg.embed_dim, bias=self.cfg.qkv_bias)
+        self.w_atn_out = nn.Linear(self.cfg.embed_dim, self.cfg.embed_dim, bias=True)
+
+        nn.init.normal_(self.w_atn_out.weight, mean=0.0, std=0.02/math.sqrt(2 * self.cfg.num_blocks))
+
+    def forward(self, xs: Tensor) -> Tensor:
+        x_v: Tensor = self.w_v(xs).view(-1, self.cfg.ctx_size, self.cfg.num_heads, self.cfg.head_dim).transpose(1, 2)
+
+        x_reshaped = xs.view(-1, self.cfg.ctx_size, self.cfg.num_heads, self.cfg.head_dim).transpose(1, 2)
+
+        x_atn = F.scaled_dot_product_attention(x_reshaped, x_reshaped, x_v, attn_mask=None, is_causal=self.cfg.is_causal)
+
+        x_out = self.w_atn_out(x_atn.transpose(1, 2).view(xs.size()))
+
+        return x_out
+        
         
 class TrafoBlock(nn.Module):
     def __init__(self, cfg: TrafoConfig):
@@ -52,11 +73,11 @@ class TrafoBlock(nn.Module):
 
         self.ln_atn = nn.LayerNorm(self.cfg.embed_dim)
 
-        self.atn = MHSA(cfg)
+        # self.atn = MHSA(cfg)
+        self.atn = ModifiedMHSA(cfg)
 
         self.ln_ff = nn.LayerNorm(self.cfg.embed_dim)
         
-
         self.ff1 = nn.Linear(self.cfg.embed_dim, self.cfg.ff_dim)
         self.ff2 = nn.Linear(self.cfg.ff_dim, self.cfg.embed_dim)
 
@@ -67,11 +88,11 @@ class TrafoBlock(nn.Module):
         x_ln_atn = self.ln_atn(xs)
         x_atn = self.atn(x_ln_atn)
 
-        x_ln_ff = self.ln_ff(xs)
+        x_ln_ff = self.ln_ff(x_atn)
         x_ff1 = F.gelu(self.ff1(x_ln_ff))
         x_ff2 = self.ff2(x_ff1)
 
-        return xs + x_atn + x_ff2
+        return xs + x_ff2
 
         
 class Trafo(nn.Module):
